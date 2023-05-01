@@ -1,0 +1,24 @@
+version: "3"
+
+services:
+  nginx:
+    image: nginx:latest
+    network_mode: host
+    command: >
+      /bin/bash -c "echo '
+        events {
+          worker_connections 1024;
+        }
+        http {
+          server {
+            listen 50050;
+            location / {
+              proxy_pass http://127.0.0.1:50053;
+            }
+
+            location ~ ^/(relay|eth)/(.*?)$$ {
+              proxy_pass http://127.0.0.1:50051/$$1/$$2$$is_args$$args;
+            }
+          }
+        }
+      ' > /etc/nginx/nginx.conf && exec nginx-debug -g 'daemon off;'"

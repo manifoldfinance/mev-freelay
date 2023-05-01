@@ -1,0 +1,19 @@
+# One CLI to format the code tree - https://github.com/numtide/treefmt
+
+[formatter.prettier]
+command = "prettier"
+options = ["--write"]
+includes = [
+ "*.css",
+ "*.js",
+ "*.json",
+ "*.md",
+ "*.yaml",
+ "*.yml",
+]
+excludes = []
+
+[formatter.go]
+command = "gofmt"
+options = ["-w"]
+includes = ["*.go"]

@@ -1,0 +1,16 @@
+.gitignore
+.prettierrc.js
+.prettierignore
+.golangci.yml
+.envrc
+.envrc.local
+.github
+.git
+tmp
+dbs
+shell.nix
+README.md
+minio.yaml
+ingress.yaml
+Makefile
+treefmt.toml

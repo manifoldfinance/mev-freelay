@@ -1,0 +1,160 @@
+<!-- Copyright (c) 2023 Manifold Finance, Inc. -->
+<!-- The Universal Permissive License (UPL), Version 1.0 -->
+<!-- Subject to the condition set forth below, permission is hereby granted to any person obtaining a copy of this software, associated documentation and/or data (collectively the “Software”), free of charge and under any and all copyright rights in the Software, and any and all patent rights owned or freely licensable by each licensor hereunder covering either (i) the unmodified Software as contributed to or provided by such licensor, or (ii) the Larger Works (as defined below), to deal in both -->
+<!-- (a) the Software, and -->
+<!-- (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if one is included with the Software (each a “Larger Work” to which the Software is contributed by such licensors), -->
+<!-- without restriction, including without limitation the rights to copy, create derivative works of, display, perform, and distribute the Software and make, use, sell, offer for sale, import, export, have made, and have sold the Software and the Larger Work(s), and to sublicense the foregoing rights on either these or other terms. -->
+<!-- This license is subject to the following condition: -->
+<!-- The above copyright notice and either this complete permission notice or at a minimum a reference to the UPL must be included in all copies or substantial portions of the Software. -->
+<!-- THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. -->
+<!-- This script ensures source code files have copyright license headers. See license.sh for more information. -->
+<div class="mt-4 pb-24 flex flex-col">
+    <h2 class="text-gray-600 w-full text-right pb-2">
+        <span class="font-bold">{{ data.num_builders }}</span>
+        of
+        <span class="font-bold">{{ data.num_total_builders }}</span>
+    </h2>
+
+    <div class="overflow-x-auto -my-2 -mx-4 px-4">
+        <div class="inline-block min-w-full py-2 align-middle">
+            <div class="overflow-hidden">
+                <ul role="list" class="divide-y divide-gray-200">
+                    {{#data.builders}}
+                        <li class="overflow-hidden bg-white shadow sm:rounded-lg mb-6">
+                            <div class="px-4 py-5 sm:px-6">
+                                <h3 class="text-xl font-medium leading-6 text-gray-900">Public Key</h3>
+                                <p class="mt-1 max-w-2xl text-sm text-gray-500 whitespace-normal break-all w-full min-w-full">{{ builder_pubkey }}</p>
+                            </div>
+                            <div class="border-t border-gray-200 px-4 py-5 sm:px-6">
+                                <h3 class="font-medium text-medium pb-4">General Information</h3>
+                                <dl class="grid grid-cols-1 gap-x-2 gap-y-6 xl:grid-cols-4 lg:grid-cols-3 md:grid-cols-2">
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Created At</dt>
+                                        <dd class="mt-1 text-sm text-gray-900 flex h-full max-h-6 items-center" title={{ created_at }}>{{ created_at_str }}</dd>
+                                    </div>
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Updated At</dt>
+                                        <dd class="mt-1 text-sm text-gray-900 flex h-full max-h-6 items-center" title={{ updated_at }}>{{ updated_at_str }}</dd>
+                                    </div>
+
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Blacklisted</dt>
+                                        <dd class="mt-1 text-sm text-gray-900 flex h-full max-h-6 items-center">{{ blacklisted_str }}</dd>
+                                    </div>
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">High Priority</dt>
+                                        <dd class="mt-1 text-sm text-gray-900 flex h-full max-h-6 items-center">{{ high_priority_str }}</dd>
+                                    </div>
+                                    {{#showDescription}}
+                                        <div class="sm:col-span-2">
+                                            <dt class="text-sm font-medium text-gray-500">Description</dt>
+                                            <dd class="mt-1 text-sm text-gray-900">{{ description }}</dd>
+                                        </div>
+                                    {{/showDescription}}
+                                </dl>
+                            </div>
+                            <div class="border-t border-gray-200 px-4 py-5 sm:px-6">
+                                <h3 class="font-medium text-medium pb-4">Submitted</h3>
+                                <dl class="grid grid-cols-1 gap-x-2 gap-y-6 xl:grid-cols-4 lg:grid-cols-3 md:grid-cols-2">
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Initial Slot</dt>
+                                        <dd class="mt-1 text-sm text-gray-900">
+                                            <div class="flex items-center h-full max-h-6">
+                                                <span>{{ initial_submission_slot }}</span>
+                                                {{#show_submission_link}}
+                                                    <a href="{{ beaconchain_url }}{{ first_submission_slot }}" class="ml-1 -mt-[7px] fill-white hover:fill-blue-100" target="_blank">
+                                                        {{ >beacon_icon.mustache }}
+                                                    </a>
+                                                {{/show_submission_link}}
+                                            </div>
+                                            {{#show_submission_link}}
+                                                <div class="mt-1">
+                                                    <span class="text-gray-500">at</span>&nbsp;
+                                                    <span title={{ first_submission_at }}>{{ first_submission_at_str }}</span>
+                                                </div>
+                                            {{/show_submission_link}}
+                                        </dd>
+                                    </div>
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Latest Slot</dt>
+                                        <dd class="mt-1 text-sm text-gray-900">
+                                            <div class="flex items-center h-full max-h-6">
+                                                <span>{{ final_submission_slot }}</span>
+                                                {{#show_final_submission_link}}
+                                                    <a href="{{ beaconchain_url }}{{ last_submission_slot }}" class="ml-1 -mt-[7px] fill-white hover:fill-blue-100" target="_blank">
+                                                        {{ >beacon_icon.mustache }}
+                                                    </a>
+                                                {{/show_final_submission_link}}
+                                            </div>
+                                            {{#show_final_submission_at}}
+                                                <div class="mt-1">
+                                                    <span class="text-gray-500">at</span>&nbsp;
+                                                    <span title={{ last_submission_at }}>{{ final_submission_at_str }}</span>
+                                                </div>
+                                            {{/show_final_submission_at}}
+                                        </dd>
+                                    </div>
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Total</dt>
+                                        <dd class="mt-1 text-sm text-gray-900 flex h-full max-h-6 items-center">{{ num_submissions_total }}</dd>
+                                    </div>
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Simulation Failed</dt>
+                                        <dd class="mt-1 text-sm text-gray-900 flex h-full max-h-6 items-center">{{ num_submissions_sim_failed }}</dd>
+                                    </div>
+                                </dl>
+                            </div>
+                            <div class="border-t border-gray-200 px-4 py-5 sm:px-6">
+                                <h3 class="font-medium text-medium pb-4">Delivered</h3>
+                                <dl class="grid grid-cols-1 gap-x-2 gap-y-6 xl:grid-cols-4 lg:grid-cols-3 md:grid-cols-2">
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Initial Slot</dt>
+                                        <dd class="mt-1 text-sm text-gray-900">
+                                            <div class="flex items-center h-full max-h-6">
+                                                <span>{{ initial_delivered_slot }}</span>
+                                                {{#show_delivered_link}}
+                                                    <a href="{{ beaconchain_url }}{{ first_delivered_slot }}" class="ml-1 -mt-[7px] fill-white hover:fill-blue-100" target="_blank">
+                                                        {{ >beacon_icon.mustache }}
+                                                    </a>
+                                                {{/show_delivered_link}}
+                                            </div>
+                                            {{#show_delivered_link}}
+                                                <div class="mt-1">
+                                                    <span class="text-gray-500">at</span>&nbsp;
+                                                    <span title={{ first_delivered_at }}>{{ first_delivered_at_str }}</span>
+                                                </div>
+                                            {{/show_delivered_link}}
+                                        </dd>
+                                    </div>
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Latest Slot</dt>
+                                        <dd class="mt-1 text-sm text-gray-900">
+                                            <div class="flex items-center h-full max-h-6">
+                                                <span>{{ final_delivered_slot }}</span>
+                                                {{#show_final_delivered_link}}
+                                                    <a href="{{ beaconchain_url }}{{ last_delivered_slot }}" class="ml-1 -mt-[7px] fill-white hover:fill-blue-100" target="_blank">
+                                                        {{ >beacon_icon.mustache }}
+                                                    </a>
+                                                {{/show_final_delivered_link}}
+                                            </div>
+                                            {{#show_final_delivered_at}}
+                                                <div class="mt-1">
+                                                    <span class="text-gray-500">at</span>&nbsp;
+                                                    <span title={{ last_delivered_at }}>{{ final_delivered_at_str }}</span>
+                                                </div>
+                                            {{/show_final_delivered_at}}
+                                        </dd>
+                                    </div>
+                                    <div class="sm:col-span-1">
+                                        <dt class="text-sm font-medium text-gray-500">Total</dt>
+                                        <dd class="mt-1 text-sm text-gray-900 flex h-full max-h-6 items-center">{{ num_delivered_total }}</dd>
+                                    </div>
+                                </dl>
+                            </div>
+                        </li>
+                    {{/data.builders}}
+                </ul>
+            </div>
+        </div>
+    </div>
+</section>
