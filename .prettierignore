@@ -1,0 +1,6 @@
+.github
+**/*.go
+**/*.yml
+tmp
+dbs
+node_modules

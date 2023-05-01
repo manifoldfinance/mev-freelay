@@ -1,0 +1,779 @@
+basePath: /
+definitions:
+  uint64:
+    type: string
+    description: Positive integer number
+    example: "1"
+  gwei:
+    type: string
+    description: Positive integer number
+    example: "1"
+  bigInt:
+    type: string
+    description: Positive big integer number
+    example: "10000000"
+  pubkey:
+    type: string
+    description: Hex encoded public key
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]{96}$"
+  hash:
+    type: string
+    description: Hex encoded hash
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]{64}$"
+  root:
+    type: string
+    description: Hex encoded root
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]{64}$"
+  address:
+    type: string
+    description: Hex encoded address
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]{40}$"
+  signature:
+    type: string
+    description: Hex encoded signature
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]{192}$"
+  committeeBits:
+    type: string
+    description: Hex encoded committee bits
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]+{128}$"
+  extraData:
+    type: string
+    description: Hex encoded extra data
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]+{64}$"
+  bloom:
+    type: string
+    description: Hex encoded bloom
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]+{512}$"
+  timestamp:
+    type: string
+    description: Unix timestamp
+    example: "1555555555"
+  timestampMS:
+    type: string
+    description: Unix timestamp in milliseconds
+    example: "1555555500000"
+  transaction:
+    type: string
+    description: Hex encoded transaction
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]+{198}$"
+  bits:
+    type: string
+    description: Hex encoded bits
+    example: "0x00000000000"
+    pattern: "^0x[0-9a-fA-F]+{4096}$"
+  withdrawal:
+    properties:
+      index:
+        $ref: "#/definitions/uint64"
+      validator_index:
+        $ref: "#/definitions/uint64"
+      address:
+        $ref: "#/definitions/address"
+      amount:
+        $ref: "#/definitions/gwei"
+    type: object
+  freelay.BidTrace:
+    properties:
+      block_hash:
+        $ref: "#/definitions/hash"
+      block_number:
+        $ref: "#/definitions/uint64"
+      builder_pubkey:
+        $ref: "#/definitions/pubkey"
+      gas_limit:
+        $ref: "#/definitions/uint64"
+      gas_used:
+        $ref: "#/definitions/uint64"
+      num_tx:
+        $ref: "#/definitions/uint64"
+      parent_hash:
+        $ref: "#/definitions/hash"
+      proposer_fee_recipient:
+        $ref: "#/definitions/address"
+      proposer_pubkey:
+        $ref: "#/definitions/pubkey"
+      slot:
+        $ref: "#/definitions/uint64"
+      value:
+        $ref: "#/definitions/bigInt"
+    type: object
+  freelay.BidTraceReceived:
+    properties:
+      block_hash:
+        $ref: "#/definitions/hash"
+      block_number:
+        $ref: "#/definitions/uint64"
+      builder_pubkey:
+        $ref: "#/definitions/pubkey"
+      gas_limit:
+        $ref: "#/definitions/uint64"
+      gas_used:
+        $ref: "#/definitions/uint64"
+      num_tx:
+        $ref: "#/definitions/uint64"
+      parent_hash:
+        $ref: "#/definitions/hash"
+      proposer_fee_recipient:
+        $ref: "#/definitions/address"
+      proposer_pubkey:
+        $ref: "#/definitions/pubkey"
+      slot:
+        $ref: "#/definitions/uint64"
+      value:
+        $ref: "#/definitions/bigInt"
+      timestamp:
+        $ref: "#/definitions/timestamp"
+      timestamp_ms:
+        $ref: "#/definitions/timestampMS"
+    type: object
+  freelay.JSONError:
+    properties:
+      code:
+        description: HTTP status code
+        type: integer
+      message:
+        description: Error message
+        type: string
+    type: object
+  types.Attestation:
+    properties:
+      aggregation_bits:
+        description: MAX_VALIDATORS_PER_COMMITTEE
+        $ref: "#/definitions/bits"
+      data:
+        $ref: "#/definitions/types.AttestationData"
+      signature:
+        $ref: "#/definitions/signature"
+    type: object
+  types.AttestationData:
+    properties:
+      beacon_block_root:
+        $ref: "#/definitions/root"
+      index:
+        example: "0"
+        type: string
+      slot:
+        $ref: "#/definitions/uint64"
+      source:
+        $ref: "#/definitions/types.Checkpoint"
+      target:
+        $ref: "#/definitions/types.Checkpoint"
+    type: object
+  types.AttesterSlashing:
+    properties:
+      attestation_1:
+        $ref: "#/definitions/types.IndexedAttestation"
+      attestation_2:
+        $ref: "#/definitions/types.IndexedAttestation"
+    type: object
+  types.BeaconBlockHeader:
+    properties:
+      body_root:
+        $ref: "#/definitions/root"
+      parent_root:
+        $ref: "#/definitions/root"
+      proposer_index:
+        $ref: "#/definitions/uint64"
+      slot:
+        $ref: "#/definitions/uint64"
+      state_root:
+        $ref: "#/definitions/root"
+
+    type: object
+  types.BidTrace:
+    properties:
+      block_hash:
+        $ref: "#/definitions/hash"
+      builder_pubkey:
+        $ref: "#/definitions/pubkey"
+      gas_limit:
+        $ref: "#/definitions/uint64"
+      gas_used:
+        $ref: "#/definitions/uint64"
+      parent_hash:
+        $ref: "#/definitions/hash"
+      proposer_fee_recipient:
+        $ref: "#/definitions/address"
+      proposer_pubkey:
+        $ref: "#/definitions/pubkey"
+      slot:
+        $ref: "#/definitions/uint64"
+      value:
+        $ref: "#/definitions/bigInt"
+    type: object
+  types.BlindedBeaconBlock:
+    properties:
+      body:
+        $ref: "#/definitions/types.BlindedBeaconBlockBody"
+      parent_root:
+        $ref: "#/definitions/root"
+      proposer_index:
+        $ref: "#/definitions/uint64"
+      slot:
+        $ref: "#/definitions/uint64"
+      state_root:
+        $ref: "#/definitions/root"
+
+    type: object
+  types.BlindedBeaconBlockBody:
+    properties:
+      attestations:
+        items:
+          $ref: "#/definitions/types.Attestation"
+        type: array
+      attester_slashings:
+        items:
+          $ref: "#/definitions/types.AttesterSlashing"
+        type: array
+      deposits:
+        items:
+          $ref: "#/definitions/types.Deposit"
+        type: array
+      eth1_data:
+        $ref: "#/definitions/types.Eth1Data"
+      execution_payload_header:
+        $ref: "#/definitions/types.ExecutionPayloadHeader"
+      graffiti:
+        $ref: "#/definitions/hash"
+      proposer_slashings:
+        items:
+          $ref: "#/definitions/types.ProposerSlashing"
+        type: array
+      randao_reveal:
+        $ref: "#/definitions/signature"
+      sync_aggregate:
+        $ref: "#/definitions/types.SyncAggregate"
+      voluntary_exits:
+        items:
+          $ref: "#/definitions/types.SignedVoluntaryExit"
+        type: array
+    type: object
+  types.BuilderBid:
+    properties:
+      header:
+        $ref: "#/definitions/types.ExecutionPayloadHeader"
+      pubkey:
+        $ref: "#/definitions/pubkey"
+      value:
+        $ref: "#/definitions/bigInt"
+    type: object
+
+  .BuilderGetValidatorsResponseEntry:
+    properties:
+      entry:
+        $ref: "#/definitions/types.SignedValidatorRegistration"
+      slot:
+        $ref: "#/definitions/uint64"
+      validator_index:
+        $ref: "#/definitions/uint64"
+    type: object
+  buildercapella.SubmitBlockRequest:
+    properties:
+      execution_payload:
+        $ref: "#/definitions/apicapella.ExecutionPayload"
+      message:
+        $ref: "#/definitions/types.BidTrace"
+      signature:
+        $ref: "#/definitions/signature"
+    type: object
+  types.Checkpoint:
+    properties:
+      epoch:
+        $ref: "#/definitions/uint64"
+      root:
+        $ref: "#/definitions/root"
+    type: object
+  types.Deposit:
+    properties:
+      data:
+        $ref: "#/definitions/types.DepositData"
+      proof:
+        items:
+          items:
+            type: integer
+          type: array
+        type: array
+    type: object
+  types.DepositData:
+    properties:
+      amount:
+        $ref: "#/definitions/uint64"
+      pubkey:
+        $ref: "#/definitions/pubkey"
+      signature:
+        $ref: "#/definitions/signature"
+      withdrawal_credentials:
+        $ref: "#/definitions/hash"
+    type: object
+  types.Eth1Data:
+    properties:
+      block_hash:
+        $ref: "#/definitions/hash"
+      deposit_count:
+        $ref: "#/definitions/uint64"
+      deposit_root:
+        $ref: "#/definitions/root"
+    type: object
+  apicapella.ExecutionPayload:
+    properties:
+      base_fee_per_gas:
+        $ref: "#/definitions/bigInt"
+      block_hash:
+        $ref: "#/definitions/hash"
+      block_number:
+        $ref: "#/definitions/uint64"
+      extra_data:
+        $ref: "#/definitions/extraData"
+      fee_recipient:
+        $ref: "#/definitions/address"
+      gas_limit:
+        $ref: "#/definitions/uint64"
+      gas_used:
+        $ref: "#/definitions/uint64"
+      logs_bloom:
+        $ref: "#/definitions/bloom"
+      parent_hash:
+        $ref: "#/definitions/hash"
+      prev_randao:
+        $ref: "#/definitions/hash"
+      receipts_root:
+        $ref: "#/definitions/root"
+      state_root:
+        $ref: "#/definitions/root"
+      timestamp:
+        $ref: "#/definitions/timestamp"
+      transactions:
+        items:
+          $ref: "#/definitions/transaction"
+        type: array
+      withdrawals:
+        items:
+          $ref: "#/definitions/withdrawal"
+        type: array
+    type: object
+  types.ExecutionPayloadHeader:
+    properties:
+      base_fee_per_gas:
+        $ref: "#/definitions/bigInt"
+      block_hash:
+        $ref: "#/definitions/hash"
+      block_number:
+        $ref: "#/definitions/uint64"
+      extra_data:
+        $ref: "#/definitions/extraData"
+      fee_recipient:
+        $ref: "#/definitions/address"
+      gas_limit:
+        $ref: "#/definitions/uint64"
+      gas_used:
+        $ref: "#/definitions/uint64"
+      logs_bloom:
+        $ref: "#/definitions/bloom"
+      parent_hash:
+        $ref: "#/definitions/hash"
+      prev_randao:
+        $ref: "#/definitions/signature"
+      receipts_root:
+        $ref: "#/definitions/root"
+      state_root:
+        $ref: "#/definitions/root"
+      timestamp:
+        $ref: "#/definitions/timestamp"
+      transactions_root:
+        $ref: "#/definitions/root"
+    type: object
+  builderspec.VersionedSignedBuilderBid:
+    properties:
+      capella:
+        $ref: "#/definitions/types.SignedBuilderBid"
+      bellatrix:
+        $ref: "#/definitions/types.SignedBuilderBid"
+      version:
+        type: string
+    type: object
+  types.GetPayloadResponse:
+    properties:
+      capella:
+        $ref: "#/definitions/apicapella.ExecutionPayload"
+      bellatrix:
+        $ref: "#/definitions/types.ExecutionPayload"
+      version:
+        type: string
+    type: object
+  types.IndexedAttestation:
+    properties:
+      yu:
+        description: MAX_VALIDATORS_PER_COMMITTEE
+        $ref: "#/definitions/bits"
+      data:
+        $ref: "#/definitions/types.AttestationData"
+      signature:
+        $ref: "#/definitions/signature"
+    type: object
+  types.ProposerSlashing:
+    properties:
+      signed_header_1:
+        $ref: "#/definitions/types.SignedBeaconBlockHeader"
+      signed_header_2:
+        $ref: "#/definitions/types.SignedBeaconBlockHeader"
+    type: object
+  types.RegisterValidatorRequestMessage:
+    properties:
+      fee_recipient:
+        $ref: "#/definitions/address"
+      gas_limit:
+        $ref: "#/definitions/uint64"
+      pubkey:
+        $ref: "#/definitions/pubkey"
+      timestamp:
+        $ref: "#/definitions/timestamp"
+    type: object
+  types.SignedBeaconBlockHeader:
+    properties:
+      message:
+        $ref: "#/definitions/types.BeaconBlockHeader"
+      signature:
+        $ref: "#/definitions/signature"
+    type: object
+  apicapella.SignedBlindedBeaconBlock:
+    properties:
+      message:
+        $ref: "#/definitions/types.BlindedBeaconBlock"
+      signature:
+        $ref: "#/definitions/signature"
+    type: object
+  types.SignedBuilderBid:
+    properties:
+      message:
+        $ref: "#/definitions/types.BuilderBid"
+      signature:
+        $ref: "#/definitions/signature"
+    type: object
+  types.SignedValidatorRegistration:
+    properties:
+      message:
+        $ref: "#/definitions/types.RegisterValidatorRequestMessage"
+      signature:
+        $ref: "#/definitions/signature"
+    type: object
+  types.SignedVoluntaryExit:
+    properties:
+      message:
+        $ref: "#/definitions/types.VoluntaryExit"
+      signature:
+        $ref: "#/definitions/signature"
+    type: object
+  types.SyncAggregate:
+    properties:
+      sync_committee_bits:
+        $ref: "#/definitions/committeeBits"
+      sync_committee_signature:
+        $ref: "#/definitions/signature"
+    type: object
+  types.VoluntaryExit:
+    properties:
+      epoch:
+        $ref: "#/definitions/uint64"
+      validator_index:
+        $ref: "#/definitions/uint64"
+    type: object
+host: localhost:50051
+info:
+  contact:
+    email: <>
+    name: Manifold Finance Team
+    url: https://www.manifoldfinance.com/
+  description: Specification for the Freelay API.
+  license:
+    name: The Universal Permissive License (UPL), Version 1.0
+    url: https://oss.oracle.com/licenses/upl/
+  title: Freelay API
+  version: "1.0"
+paths:
+  /eth/v1/builder/blinded_blocks:
+    post:
+      consumes:
+        - application/json
+      description: Unblind block
+      parameters:
+        - description: Signed blinded beacon block
+          in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/apicapella.SignedBlindedBeaconBlock"
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: "#/definitions/builderapi.VersionedExecutionPayload"
+        "400":
+          description: Bad Request
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+      summary: Unblind block
+      tags:
+        - Proposer
+  /eth/v1/builder/header/{slot}/{parentHash}/{pubKey}:
+    get:
+      consumes:
+        - application/json
+      description: Get header response
+      parameters:
+        - description: Slot
+          in: path
+          name: slot
+          required: true
+          type: string
+        - description: Parent hash
+          in: path
+          name: parentHash
+          required: true
+          type: string
+        - description: Pubkey
+          in: path
+          name: pubKey
+          required: true
+          type: string
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: "#/definitions/builderspec.VersionedSignedBuilderBid"
+        "400":
+          description: Bad Request
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+      summary: Header
+      tags:
+        - Proposer
+  /eth/v1/builder/status:
+    get:
+      description: Get the health status of the relay server
+      responses:
+        "200":
+          description: OK
+      summary: Health check
+      tags:
+        - Proposer
+  /eth/v1/builder/validators:
+    post:
+      consumes:
+        - application/json
+      description: Register or update validator's
+      parameters:
+        - description: Signed validator registration
+          in: body
+          name: body
+          required: true
+          schema:
+            items:
+              $ref: "#/definitions/types.SignedValidatorRegistration"
+            type: array
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Bad Request
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+      summary: Register validators
+      tags:
+        - Proposer
+  /relay/v1/builder/blocks:
+    post:
+      consumes:
+        - application/json
+      parameters:
+        - description: BuilderSubmitBlockRequest
+          in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/buildercapella.SubmitBlockRequest"
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Bad Request
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+        "501":
+          description: Not Implemented
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+      summary: Submit new block
+      tags:
+        - Builder
+  /relay/v1/builder/validators:
+    get:
+      consumes:
+        - application/json
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: "#/definitions/BuilderGetValidatorsResponseEntry"
+            type: array
+      summary: Validators scheduled to propose current and next epoch
+      tags:
+        - Builder
+  /relay/v1/data/bidtraces/builder_blocks_received:
+    get:
+      consumes:
+        - application/json
+      description: Builder blocks received
+      parameters:
+        - description: slot
+          in: query
+          name: slot
+          required: true
+          type: string
+        - description: blockHash
+          in: query
+          name: blockHash
+          required: true
+          type: string
+        - description: blockNumber
+          in: query
+          name: blockNumber
+          required: true
+          type: string
+        - description: limit
+          in: query
+          name: limit
+          required: true
+          type: string
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: "#/definitions/freelay.BidTraceReceived"
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+      summary: Builder blocks received
+      tags:
+        - Data
+  /relay/v1/data/bidtraces/proposer_payload_delivered:
+    get:
+      consumes:
+        - application/json
+      description: Proposer payload delivered
+      parameters:
+        - description: slot
+          in: query
+          name: slot
+          required: true
+          type: string
+        - description: cursor
+          in: query
+          name: cursor
+          required: true
+          type: string
+        - description: proposerPubkey
+          in: query
+          name: proposerPubkey
+          required: true
+          type: string
+        - description: blockHash
+          in: query
+          name: blockHash
+          required: true
+          type: string
+        - description: builderPubkey
+          in: query
+          name: builderPubkey
+          required: true
+          type: string
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: "#/definitions/freelay.BidTrace"
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+      summary: Proposer payload delivered
+      tags:
+        - Data
+  /relay/v1/data/validator_registration:
+    get:
+      consumes:
+        - application/json
+      description: Registered validator
+      parameters:
+        - description: pubkey
+          in: query
+          name: pubkey
+          required: true
+          type: string
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: "#/definitions/types.SignedValidatorRegistration"
+        "400":
+          description: Bad Request
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: "#/definitions/freelay.JSONError"
+      summary: Registered validator
+      tags:
+        - Data
+swagger: "2.0"

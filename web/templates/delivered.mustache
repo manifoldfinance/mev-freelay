@@ -1,0 +1,238 @@
+<!-- Copyright (c) 2023 Manifold Finance, Inc. -->
+<!-- The Universal Permissive License (UPL), Version 1.0 -->
+<!-- Subject to the condition set forth below, permission is hereby granted to any person obtaining a copy of this software, associated documentation and/or data (collectively the “Software”), free of charge and under any and all copyright rights in the Software, and any and all patent rights owned or freely licensable by each licensor hereunder covering either (i) the unmodified Software as contributed to or provided by such licensor, or (ii) the Larger Works (as defined below), to deal in both -->
+<!-- (a) the Software, and -->
+<!-- (b) any piece of software and/or hardware listed in the lrgrwrks.txt file if one is included with the Software (each a “Larger Work” to which the Software is contributed by such licensors), -->
+<!-- without restriction, including without limitation the rights to copy, create derivative works of, display, perform, and distribute the Software and make, use, sell, offer for sale, import, export, have made, and have sold the Software and the Larger Work(s), and to sublicense the foregoing rights on either these or other terms. -->
+<!-- This license is subject to the following condition: -->
+<!-- The above copyright notice and either this complete permission notice or at a minimum a reference to the UPL must be included in all copies or substantial portions of the Software. -->
+<!-- THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. -->
+<!-- This script ensures source code files have copyright license headers. See license.sh for more information. -->
+<div class="mt-8 pb-24 flex flex-col">
+    <h2 class="text-gray-600 w-full text-right pb-2">
+        <span class="font-bold">{{ delivered_count }}</span>
+        of
+        <span class="font-bold">{{ data.total_delivered_payloads }}</span>
+    </h2>
+
+    <div class="overflow-x-auto -my-2 -mx-4 px-4">
+        <div class="inline-block min-w-full py-2 align-middle">
+            <div class="overflow-hidden shadow ring-1 ring-black ring-opacity-5 md:rounded-lg">
+                <table class="min-w-full divide-y divide-gray-300">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th scope="col" class="py-3.5 pl-4 pr-3 text-left text-sm font-semibold text-gray-900">
+                                Epoch
+                            </th>
+                            <th scope="col" class="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">
+                                <button class="group inline-flex" id="orderBySlot">
+                                    Slot
+                                    <!-- Active: "bg-gray-200 text-gray-900 group-hover:bg-gray-300", Not Active: "invisible text-gray-400 group-hover:visible group-focus:visible" -->
+                                    <span
+                                        class="ml-2 flex-none invisible rounded text-gray-400 group-hover:visible group-focus:visible" id="orderBySlotIndicator">
+                                        <!-- Heroicon name: mini/chevron-down -->
+                                        <svg class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewbox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                                            <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/>
+                                        </svg>
+                                    </span>
+                                </button>
+                            </th>
+                            <th scope="col" class="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">
+                                Block Number
+                            </th>
+                            <th scope="col" class="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">
+                                Timestamp
+                            </th>
+                            <th scope="col" class="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">
+                                <button class="group inline-flex" id="orderByValue">
+                                    Value(ETH)
+                                    <span class="ml-2 flex-none invisible rounded text-gray-400 group-hover:visible group-focus:visible" id="orderByValueIndicator">
+                                        <svg id="orderByValueIndicatorDown" class="h-5 w-5 group-hover:visible group-focus:visible" xmlns="http://www.w3.org/2000/svg" viewbox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                                            <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/>
+                                        </svg>
+                                        <svg id="orderByValueIndicatorUp" class="w-5 h-5 hidden" xmlns="http://www.w3.org/2000/svg" viewbox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                                            <path fill-rule="evenodd" d="M14.77 12.79a.75.75 0 01-1.06-.02L10 8.832 6.29 12.77a.75.75 0 11-1.08-1.04l4.25-4.5a.75.75 0 011.08 0l4.25 4.5a.75.75 0 01-.02 1.06z" clip-rule="evenodd"/>
+                                        </svg>
+                                    </span>
+
+                                </button>
+                            </th>
+                            <th scope="col" class="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">
+                                Num TX
+                            </th>
+                            <th scope="col" class="px-3 py-3.5 text-left text-sm font-semibold text-gray-900">
+                                Block Hash
+                            </th>
+                            <th scope="col" class="relative py-3.5 pl-3 pr-4"></th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-200 bg-white">
+                        {{#data.delivered_payload}}
+                            <tr class="hover:bg-blue-100 fill-white hover:fill-blue-100">
+                                <td class="whitespace-nowrap pl-4 py-4 text-sm text-gray-500" title={{ epoch }}>{{ epoch }}</td>
+                                <td class="whitespace-nowrap px-3 py-4 text-sm font-medium" title={{ slot }}>
+                                    <a href="/relay/v1/data/bidtraces/proposer_payload_delivered?slot={{ slot }}" class="text-indigo-600 hover:text-indigo-900 visited:text-purple-500" target="_blank">{{ slot }}</a>
+                                </td>
+                                <td class="whitespace-nowrap px-3 py-4 text-sm text-gray-500" title={{ block_number }}>{{ block_number }}</td>
+                                <td class="whitespace-nowrap px-3 py-4 text-sm text-gray-500" data-timestamp="{{ timestamp_ms }}" title="{{ timestamp }}">...</td>
+                                <td class="whitespace-nowrap px-3 py-4 text-sm text-gray-500" title={{ value }}>{{ value }}</td>
+                                <td class="whitespace-nowrap px-3 py-4 text-sm text-gray-500" title={{ num_tx }}>{{ num_tx }}</td>
+                                <td class="whitespace-nowrap px-3 py-4 text-sm text-gray-500 overflow-hidden text-ellipsis" title={{ block_hash }}>{{ block_hash }}</td>
+                                <td class="relative whitespace-nowrap py-4 pl-3 pr-2 text-right text-sm font-medium min-w-[70px]">
+                                    <div class="flex flex-space-1">
+                                        <a href="{{ beaconchain_url }}{{ slot }}" target="_blank">
+                                            {{ >beacon_icon.mustache }}
+                                        </a>
+                                        <a href="{{ etherscan_url }}{{ block_number }}" target="_blank" class="ml-1">
+                                            <img src="/etherscan.svg" alt="etherscan" class="h-6 w-6"/>
+                                        </a>
+                                    </div>
+                                </td>
+                            </tr>
+                        {{/data.delivered_payload}}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function timeText(t, str) {
+            return `${t} ${str}${
+                t > 1 ? 's' : ''
+            } `
+        }
+
+        function millisecondsToDuration(ms) {
+            const years = Math.floor(ms / (365 * 24 * 60 * 60 * 1000));
+            ms = ms % (365 * 24 * 60 * 60 * 1000);
+            const months = Math.floor(ms / (30 * 24 * 60 * 60 * 1000));
+            ms = ms % (30 * 24 * 60 * 60 * 1000);
+            const weeks = Math.floor(ms / (7 * 24 * 60 * 60 * 1000));
+            ms = ms % (7 * 24 * 60 * 60 * 1000);
+            const days = Math.floor(ms / (24 * 60 * 60 * 1000));
+            ms = ms % (24 * 60 * 60 * 1000);
+            const hours = Math.floor(ms / (60 * 60 * 1000));
+            ms = ms % (60 * 60 * 1000);
+            const minutes = Math.floor(ms / (60 * 1000));
+            ms = ms % (60 * 1000);
+            const seconds = Math.floor(ms / 1000);
+
+            let characters = 0
+            let duration = "";
+            if (years > 0) {
+                duration += timeText(years, "year");
+                characters++
+            }
+            if (months > 0 && characters < 2) {
+                duration += timeText(months, "month");
+                characters++
+            }
+            if (weeks > 0 && characters < 2) {
+                duration += timeText(weeks, "week");
+                characters++
+            }
+            if (days > 0 && characters < 2) {
+                duration += timeText(days, "day");
+                characters++
+            }
+            if (hours > 0 && characters < 2) {
+                duration += timeText(hours, "hour");
+                characters++
+            }
+            if (minutes > 0 && characters < 2) {
+                duration += timeText(minutes, "minute");
+                characters++
+            }
+            if (seconds > 0 && characters < 2) {
+                duration += timeText(seconds, "second");
+                characters++
+            }
+            duration += "ago";
+
+            return duration;
+        }
+
+        var valueOrder = null;
+        document.addEventListener("DOMContentLoaded", () => {
+            const url = new URL(location.href);
+            valueOrder = url.searchParams.get("order_by");
+            document.getElementById('orderBySlotIndicator').classList.add('invisible', 'text-gray-400', 'group-hover:visible', 'group-focus:visible');
+            document.getElementById('orderByValueIndicator').classList.add('invisible', 'text-gray-400', 'group-hover:visible', 'group-focus:visible');
+            document.getElementById("orderByValueIndicatorUp").classList.add('hidden');
+            document.getElementById("orderByValueIndicatorDown").classList.add('hidden');
+
+            if (valueOrder === null) {
+                document.getElementById('orderBySlotIndicator').classList.add('bg-gray-200', 'text-gray-900', 'group-hover:bg-gray-300');
+                document.getElementById('orderBySlotIndicator').classList.remove('invisible', 'text-gray-400', 'group-hover:visible', 'group-focus:visible');
+                document.getElementById("orderByValueIndicatorDown").classList.remove('hidden');
+                return;
+            }
+
+            if (valueOrder === "-value") {
+                document.getElementById('orderByValueIndicator').classList.add('bg-gray-200', 'text-gray-900', 'group-hover:bg-gray-300');
+                document.getElementById('orderByValueIndicator').classList.remove('invisible', 'text-gray-400', 'group-hover:visible', 'group-focus:visible');
+                document.getElementById("orderByValueIndicatorDown").classList.remove('hidden');
+                return;
+            }
+
+            if (valueOrder === "value") {
+                document.getElementById('orderByValueIndicator').classList.add('bg-gray-200', 'text-gray-900', 'group-hover:bg-gray-300');
+                document.getElementById('orderByValueIndicator').classList.remove('invisible', 'text-gray-400', 'group-hover:visible', 'group-focus:visible');
+                document.getElementById("orderByValueIndicatorUp").classList.remove('hidden');
+                return;
+            }
+        });
+
+        function updateTimestamps() {
+            document.querySelectorAll('[data-timestamp]').forEach((el) => {
+                const timestamp = el.getAttribute('data-timestamp');
+                const ms = parseInt(timestamp);
+                el.innerText = millisecondsToDuration(Date.now() - ms);
+            });
+        }
+
+        document.addEventListener("DOMContentLoaded", () => {
+            updateTimestamps();
+            setInterval(() => {
+                updateTimestamps();
+            }, 1e4);
+        });
+
+        document.getElementById("orderBySlot").addEventListener('click', function () {
+            valueOrder = null
+
+            document.getElementById('orderBySlotIndicator').classList.add('bg-gray-200', 'text-gray-900', 'group-hover:bg-gray-300');
+            document.getElementById('orderBySlotIndicator').classList.remove('invisible', 'text-gray-400', 'group-hover:visible', 'group-focus:visible');
+            document.getElementById('orderByValueIndicator').classList.add('invisible', 'text-gray-400', 'group-hover:visible', 'group-focus:visible');
+            document.getElementById('orderByValueIndicator').classList.remove('bg-gray-200', 'text-gray-900', 'group-hover:bg-gray-300');
+
+            const url = new URL(location.href);
+            url.searchParams.delete("order_by");
+            history.pushState(null, '', url);
+            window.location.reload();
+        });
+
+        document.getElementById("orderByValue").addEventListener('click', function () {
+            if (valueOrder === null || valueOrder === "value") {
+                valueOrder = "-value";
+                document.getElementById("orderByValueIndicatorDown").classList.remove('hidden');
+                document.getElementById("orderByValueIndicatorUp").classList.add('hidden');
+            } else if (valueOrder === "-value") {
+                valueOrder = "value";
+                document.getElementById("orderByValueIndicatorUp").classList.remove('hidden');
+                document.getElementById("orderByValueIndicatorDown").classList.add('hidden');
+            }
+
+            document.getElementById('orderByValueIndicator').classList.add('bg-gray-200', 'text-gray-900', 'group-hover:bg-gray-300');
+            document.getElementById('orderByValueIndicator').classList.remove('invisible', 'text-gray-400', 'group-hover:visible', 'group-focus:visible');
+            document.getElementById('orderBySlotIndicator').classList.add('invisible', 'text-gray-400', 'group-hover:visible', 'group-focus:visible');
+            document.getElementById('orderBySlotIndicator').classList.remove('bg-gray-200', 'text-gray-900', 'group-hover:bg-gray-300');
+
+            const url = new URL(location.href);
+            url.searchParams.set("order_by", valueOrder);
+            history.pushState(null, '', url);
+            window.location.reload();
+        });
+    </script>
+</section>
