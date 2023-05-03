@@ -5,21 +5,24 @@ Please note that this relay has not been subjected to a security audit, and as s
 # Relays
 
 - https://goerli-relay.securerpc.com/
+- https://goerli.securerpc.com/
 
 # Code Guides
 
 - https://google.github.io/styleguide/go/ # best-practises
 - https://github.com/golang/go/wiki
 
-# Builder Specs
+# USP (Unique Selling Points)
 
-https://github.com/ethereum/builder-specs
+- Use of a single process and embedded bbolt database for persistence, leading to lower latency and resource usage for operations
+- Automatic archiving of submitted payloads to S3, which keeps the operation database length constant
+- Simple backup and restore process
 
-# Beacon API
+# Tech Stack
 
-https://ethereum.github.io/beacon-APIs/#/
+We aimed for a straightforward technology stack that is easy to manage and deploy. For handling **API** requests, we chose [httprouter](https://github.com/julienschmidt/httprouter). We chose [bbolt](https://github.com/etcd-io/bbolt) as our database due to its fast read speeds. We wrapped it with [bolted](https://github.com/draganm/bolted) for greater control over read and write operations. Finally, we used [kartusche](https://github.com/numtide/kartusche) to build the website, which utilizes [mustache](https://mustache.github.io/) templating.
 
-# Building
+# Build
 
 ```
 DOCKER_BUILDKIT=1
@@ -92,6 +95,66 @@ make fmt
 ```
 make swag
 ```
+
+# CLI
+
+## Generate Keys
+
+```
+go run cmd/keys/main.go
+```
+
+## Backup Database to S3
+
+It is using default `AWS` credentials. You can override them with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+
+```
+go run cmd/backup/main.go --backup-url http://localhost:50052/backup --bucket <bucket>
+```
+
+## Restore Database from S3
+
+It is using default `AWS` credentials. You can override them with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+
+```
+go run cmd/restore/main.go --db-dir <dir> --db-prefix <prefix> --bucket <bucket>
+```
+
+## Purge Database
+
+Archives payloads (executed-payloads, submitted, bid-traces) that are older then 6 hours in a `.tar.gz` file and uploads it to S3 and deletes them from the database.
+
+It is using default `AWS` credentials. You can override them with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+
+```
+go run cmd/purge/main.go --archive-url http://localhost:50052/archive --prune-url http://localhost:50052/prune  --bucket <bucket>
+```
+
+## Compact Database
+
+```
+go run cmd/compact/main.go --db-dir <dir> --db-prefix <prefix>
+```
+
+## Migrate Database
+
+```
+go run cmd/migrate/main.go --db-dir <dir> --db-prefix <prefix>
+```
+
+## Import Delivered Payloads
+
+```
+go run cmd/import/main.go --db-dir <dir> --db-prefix <prefix> --file <file> --sql-uri <sql-uri> --sql-table <dev_payload_delivered>
+```
+
+# Builder Specs
+
+https://github.com/ethereum/builder-specs
+
+# Beacon API
+
+https://ethereum.github.io/beacon-APIs/#/
 
 # TODO
 
