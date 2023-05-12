@@ -175,6 +175,11 @@ func main() {
 				Value:   false,
 				EnvVars: []string{"ALLOW_BUILDER_CANCELLATIONS"},
 			},
+			&cli.Uint64Flag{
+				Name:    "max-submit-block-body-size",
+				Value:   10, // 10 MB
+				EnvVars: []string{"MAX_SUBMIT_BLOCK_BODY_SIZE"},
+			},
 		},
 		Action: func(c *cli.Context) error {
 			defer zap.L().Sync() // nolint:errcheck
@@ -309,7 +314,8 @@ func main() {
 				go relay.StartSFTP(c.Context, sftpAddr, store.DB()) // nolint:errcheck
 			}
 
-			relaySvc, err := relay.NewRelay(store, beacon, known, active, duty, evtSender, relayCfg, genesis.GenesisTime, cfg.PprofAPI, cfg.MaxRateLimit, time.Duration(cfg.BeaconProposeTimeout), cfg.CutOffTimeout, cfg.TraceIP, cfg.AllowBuilderCancellations, relayTracer)
+			maxSubmitBlockBodySizeBytes := cfg.MaxSubmitBlockBodySize * 1024 * 1024
+			relaySvc, err := relay.NewRelay(store, beacon, known, active, duty, evtSender, relayCfg, genesis.GenesisTime, cfg.PprofAPI, cfg.MaxRateLimit, time.Duration(cfg.BeaconProposeTimeout), cfg.CutOffTimeout, cfg.TraceIP, cfg.AllowBuilderCancellations, maxSubmitBlockBodySizeBytes, relayTracer)
 			if err != nil {
 				logger.Error(err, "failed to create relay")
 				return err
@@ -455,6 +461,7 @@ type httpConfig struct {
 	BeaconProposeTimeout      uint64
 	CutOffTimeout             uint64
 	AllowBuilderCancellations bool
+	MaxSubmitBlockBodySize    uint64
 }
 
 func loadConfig(c *cli.Context) (config httpConfig) {
@@ -484,6 +491,7 @@ func loadConfig(c *cli.Context) (config httpConfig) {
 		BeaconProposeTimeout:      c.Uint64("beacon-propose-timeout"),
 		CutOffTimeout:             c.Uint64("cut-off-timeout"),
 		AllowBuilderCancellations: c.Bool("allow-builder-cancellations"),
+		MaxSubmitBlockBodySize:    c.Uint64("max-submit-block-body-size"),
 	}
 
 	return

@@ -66,21 +66,22 @@ type Relay interface {
 }
 
 type relay struct {
-	store                     StoreSetter
-	beacon                    MultiBeacon
-	knownValidator            KnownValidatorSetter
-	activeValidator           ActiveValidatorSetter
-	dutyState                 DutySetter
-	cfg                       *RelayConfig
-	evtSender                 EventSender
-	genesisTime               uint64
-	pprofAPI                  bool
-	maxRateLimit              uint64
-	tracer                    trace.Tracer
-	traceIP                   bool
-	beaconProposeTimeout      time.Duration
-	cutOffTimeout             uint64
-	allowBuilderCancellations bool
+	store                       StoreSetter
+	beacon                      MultiBeacon
+	knownValidator              KnownValidatorSetter
+	activeValidator             ActiveValidatorSetter
+	dutyState                   DutySetter
+	cfg                         *RelayConfig
+	evtSender                   EventSender
+	genesisTime                 uint64
+	pprofAPI                    bool
+	maxRateLimit                uint64
+	tracer                      trace.Tracer
+	traceIP                     bool
+	beaconProposeTimeout        time.Duration
+	cutOffTimeout               uint64
+	allowBuilderCancellations   bool
+	maxSubmitBlockBodySizeBytes uint64
 
 	headSlot             atomic.Uint64
 	isUpdatingPropDuties atomic.Bool
@@ -88,30 +89,31 @@ type relay struct {
 	withdrawalsState     *withdrawalsState
 }
 
-func NewRelay(store StoreSetter, beacon MultiBeacon, known KnownValidatorSetter, active ActiveValidatorSetter, duty DutySetter, evtSender EventSender, cfg *RelayConfig, genesis uint64, pprofAPI bool, maxRateLimit uint64, beaconProposeTimeout time.Duration, cutOffTimeout uint64, traceIP, allowBuilderCancellations bool, tracer trace.Tracer) (*relay, error) {
+func NewRelay(store StoreSetter, beacon MultiBeacon, known KnownValidatorSetter, active ActiveValidatorSetter, duty DutySetter, evtSender EventSender, cfg *RelayConfig, genesis uint64, pprofAPI bool, maxRateLimit uint64, beaconProposeTimeout time.Duration, cutOffTimeout uint64, traceIP, allowBuilderCancellations bool, maxSubmitBlockBodySizeBytes uint64, tracer trace.Tracer) (*relay, error) {
 	syncNode, err := beacon.BestSyncingNode()
 	if err != nil {
 		return nil, err
 	}
 
 	r := &relay{
-		store:                     store,
-		beacon:                    beacon,
-		knownValidator:            known,
-		activeValidator:           active,
-		dutyState:                 duty,
-		cfg:                       cfg,
-		evtSender:                 evtSender,
-		genesisTime:               genesis,
-		pprofAPI:                  pprofAPI,
-		maxRateLimit:              maxRateLimit,
-		tracer:                    tracer,
-		beaconProposeTimeout:      beaconProposeTimeout,
-		cutOffTimeout:             cutOffTimeout,
-		traceIP:                   traceIP,
-		allowBuilderCancellations: allowBuilderCancellations,
-		randaoState:               newRandaoState(),
-		withdrawalsState:          newWithdrawalsState(),
+		store:                       store,
+		beacon:                      beacon,
+		knownValidator:              known,
+		activeValidator:             active,
+		dutyState:                   duty,
+		cfg:                         cfg,
+		evtSender:                   evtSender,
+		genesisTime:                 genesis,
+		pprofAPI:                    pprofAPI,
+		maxRateLimit:                maxRateLimit,
+		tracer:                      tracer,
+		beaconProposeTimeout:        beaconProposeTimeout,
+		cutOffTimeout:               cutOffTimeout,
+		traceIP:                     traceIP,
+		allowBuilderCancellations:   allowBuilderCancellations,
+		maxSubmitBlockBodySizeBytes: maxSubmitBlockBodySizeBytes,
+		randaoState:                 newRandaoState(),
+		withdrawalsState:            newWithdrawalsState(),
 	}
 
 	headSlot := syncNode.Data.HeadSlot
@@ -631,12 +633,6 @@ func (s *relay) builderHeaderHandler() http.HandlerFunc {
 			return
 		}
 
-		if slot > headSlot+1 {
-			log.Error(errors.New("slot is too new"), "provided slot is too far ahead", "slot", slot, "headSlot", headSlot)
-			httpJSONError(w, http.StatusBadRequest, "slot is too far ahead")
-			return
-		}
-
 		slotStart := (s.genesisTime + slot*SecondsPerSlot) * 1000
 		timeIntoSlot := receivedAt.UnixMilli() - int64(slotStart)
 		if s.cutOffTimeout > 0 && timeIntoSlot > int64(s.cutOffTimeout) {
@@ -920,12 +916,14 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		receivedAt := time.Now().UTC()
 		allowCancellations := r.URL.Query().Get("cancellations") == "1"
+		contentType := r.Header.Get("Content-Type")
 
 		log := logger.WithValues(
 			"method", "submitNewBlock",
 			"userAgent", r.UserAgent(),
 			"receivedAt", receivedAt,
 			"allowCancellations", allowCancellations,
+			"contentType", contentType,
 		)
 
 		hReceivedAt := r.Header.Get("X-Req-Received-At")
@@ -948,13 +946,31 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 			return
 		}
 
-		payload := new(BuilderSubmitBlockRequest)
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			log.Error(err, "failed to decode payload")
-			httpJSONError(w, http.StatusBadRequest, "invalid body")
+		body, err := io.ReadAll(io.LimitReader(r.Body, int64(s.maxSubmitBlockBodySizeBytes)))
+		if err != nil {
+			log.Error(err, "failed to read body")
+			httpJSONError(w, http.StatusBadRequest, "failed to read body")
 			return
 		}
 		defer r.Body.Close() // nolint:errcheck
+
+		payload := new(BuilderSubmitBlockRequest)
+		if contentType == "application/octet-stream" {
+			payloadCapella := new(buildercapella.SubmitBlockRequest)
+			if err := payloadCapella.UnmarshalSSZ(body); err != nil {
+				log.Error(err, "failed to unmarshal ssz payload")
+			} else {
+				payload.Capella = payloadCapella
+			}
+		}
+
+		if payload == nil || payload.Capella == nil {
+			if err := json.Unmarshal(body, &payload); err != nil {
+				log.Error(err, "failed to unmarshal json payload")
+				httpJSONError(w, http.StatusBadRequest, "invalid body")
+				return
+			}
+		}
 
 		if payload.IsEmpty() {
 			log.Error(errors.New("payload incomplete"), "payload incomplete, missing message or execution payload")
@@ -1012,11 +1028,6 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 			httpJSONError(w, http.StatusBadRequest, "slot is too old")
 			return
 		}
-		if payloadBidTrace.Slot > headSlot+1 {
-			log.Error(errors.New("slot is too far ahead"), "payloads slot is too far ahead", "headSlot", headSlot, "payloadSlot", payloadBidTrace.Slot)
-			httpJSONError(w, http.StatusBadRequest, "slot is too far ahead")
-			return
-		}
 
 		etime := s.genesisTime + payloadBidTrace.Slot*SecondsPerSlot
 		if etime != payload.Timestamp() {
@@ -1031,7 +1042,8 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 			httpJSONError(w, http.StatusBadRequest, "no slot duty")
 			return
 		}
-		if slotDuty.Entry.Message.FeeRecipient != payloadBidTrace.ProposerFeeRecipient {
+
+		if !strings.EqualFold(slotDuty.Entry.Message.FeeRecipient.String(), payloadBidTrace.ProposerFeeRecipient.String()) {
 			log.Error(errors.New("fee recipient mismatch"), "slot duty and proposer fee recipient mismatch", "expected", slotDuty.Entry.Message.FeeRecipient, "actual", payloadBidTrace.ProposerFeeRecipient)
 			httpJSONError(w, http.StatusBadRequest, "fee recipient mismatch")
 			return

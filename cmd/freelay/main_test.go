@@ -64,7 +64,7 @@ func TestRelayServer(t *testing.T) {
 		sk, bpk, _   = bls.GenerateNewKeypair()
 		pk, _        = types.BlsPublicKeyToPublicKey(bpk)
 		cfgRelay, _  = relay.NewRelayConfig(cfg.Network, cfg.BlockSimURL, &pk, sk)
-		relaySvc, _  = relay.NewRelay(store, beacon, known, active, duty, evtSender, cfgRelay, uint64(time.Now().Unix()), false, cfg.MaxRateLimit, time.Duration(0), 3000, false, false, trace.NewNoopTracerProvider().Tracer("relay"))
+		relaySvc, _  = relay.NewRelay(store, beacon, known, active, duty, evtSender, cfgRelay, uint64(time.Now().Unix()), false, cfg.MaxRateLimit, time.Duration(0), 3000, false, false, 10*1024*1024, trace.NewNoopTracerProvider().Tracer("relay"))
 		quit         = make(chan struct{})
 	)
 

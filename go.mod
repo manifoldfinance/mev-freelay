@@ -3,8 +3,8 @@ module github.com/manifoldfinance/mev-freelay
 go 1.19
 
 require (
-	github.com/attestantio/go-builder-client v0.2.8
-	github.com/attestantio/go-eth2-client v0.15.8
+	github.com/attestantio/go-builder-client v0.3.0
+	github.com/attestantio/go-eth2-client v0.16.3
 	github.com/aws/aws-sdk-go-v2 v1.17.4
 	github.com/aws/aws-sdk-go-v2/config v1.18.12
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.11.51
@@ -13,8 +13,8 @@ require (
 	github.com/draganm/bolted-sftp v0.0.1
 	github.com/draganm/event-sender v0.0.2
 	github.com/draganm/kartusche v0.4.1
-	github.com/ethereum/go-ethereum v1.11.5
-	github.com/flashbots/go-boost-utils v1.5.0
+	github.com/ethereum/go-ethereum v1.11.6
+	github.com/flashbots/go-boost-utils v1.6.0
 	github.com/go-logr/logr v1.2.3
 	github.com/go-logr/zapr v1.2.3
 	github.com/holiman/uint256 v1.2.2
@@ -69,7 +69,7 @@ require (
 	github.com/cockroachdb/pebble v0.0.0-20230209160836-829675f94811 // indirect
 	github.com/cockroachdb/redact v1.1.3 // indirect
 	github.com/consensys/bavard v0.1.13 // indirect
-	github.com/consensys/gnark-crypto v0.10.0 // indirect
+	github.com/consensys/gnark-crypto v0.11.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.1.0 // indirect
@@ -87,7 +87,7 @@ require (
 	github.com/gofrs/uuid v4.2.0+incompatible // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
-	github.com/golang/snappy v0.0.4 // indirect
+	github.com/golang/snappy v0.0.5-0.20220116011046-fa5810519dcb // indirect
 	github.com/gorilla/mux v1.8.0 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect

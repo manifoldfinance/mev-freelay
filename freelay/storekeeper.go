@@ -111,6 +111,9 @@ func SetImportSqlVersion(prefix string, v uint64) error {
 	defer sDB.Close() // nolint:errcheck
 
 	if err := bolted.SugaredWrite(sDB, func(tx bolted.SugaredWriteTx) error {
+		if !tx.Exists(versionMapPth) {
+			tx.CreateMap(versionMapPth)
+		}
 		key := versionMapPth.Append(importSqlVersionKey)
 		tx.Put(key, intToByteArray(v))
 		return nil

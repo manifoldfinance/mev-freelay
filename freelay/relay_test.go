@@ -461,14 +461,20 @@ func TestSubmitNewBlocksHandler(t *testing.T) {
 		}{
 			Message: bidCapella,
 			ExecutionPayload: &consensuscapella.ExecutionPayload{
-				ParentHash:   bidCapella.ParentHash,
-				FeeRecipient: bidCapella.ProposerFeeRecipient,
-				BlockHash:    bidCapella.BlockHash,
-				ExtraData:    []byte{},
-				Timestamp:    uint64(s.genesisTime + (slot+1)*SecondsPerSlot),
-				Withdrawals:  withdrawals,
-				Transactions: []consensusbellatrix.Transaction{[]byte{0x01, 0x02, 0x03}},
-				PrevRandao:   randao,
+				ParentHash:    bidCapella.ParentHash,
+				FeeRecipient:  bidCapella.ProposerFeeRecipient,
+				BlockHash:     bidCapella.BlockHash,
+				ExtraData:     []byte{},
+				Timestamp:     uint64(s.genesisTime + (slot+1)*SecondsPerSlot),
+				Withdrawals:   withdrawals,
+				Transactions:  []consensusbellatrix.Transaction{[]byte{0x01, 0x02, 0x03}},
+				PrevRandao:    randao,
+				StateRoot:     random32Bytes(),
+				LogsBloom:     random256Bytes(),
+				BlockNumber:   123,
+				GasLimit:      bidCapella.GasLimit,
+				GasUsed:       bidCapella.GasUsed,
+				BaseFeePerGas: random32Bytes(),
 			},
 			Signature: psigCapella.String(),
 		}
@@ -548,6 +554,33 @@ func TestSubmitNewBlocksHandler(t *testing.T) {
 
 	rr = httptest.NewRecorder()
 	req, _ = http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", io.NopCloser(bytes.NewReader(bodyCapella)))
+	h = http.HandlerFunc(s.submitNewBlockHandler(newRateLimiter(1, 1)))
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	b, _ = io.ReadAll(rr.Body)
+	require.Equal(t, []byte{}, b)
+
+	// octet content type but JSON body
+	rr = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", io.NopCloser(bytes.NewReader(bodyCapella)))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	h = http.HandlerFunc(s.submitNewBlockHandler(newRateLimiter(1, 1)))
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	b, _ = io.ReadAll(rr.Body)
+	require.Equal(t, []byte{}, b)
+
+	// octet
+	sszData := &buildercapella.SubmitBlockRequest{
+		Message:          payloadCapella.Message,
+		ExecutionPayload: payloadCapella.ExecutionPayload,
+		Signature:        phase0.BLSSignature(psigCapella),
+	}
+	sszBytes, err := sszData.MarshalSSZ()
+	require.NoError(t, err)
+	rr = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", bytes.NewBuffer(sszBytes))
+	req.Header.Set("Content-Type", "application/octet-stream")
 	h = http.HandlerFunc(s.submitNewBlockHandler(newRateLimiter(1, 1)))
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
@@ -851,6 +884,10 @@ func TestSse(t *testing.T) {
 	})
 	server := httptest.NewServer(mux)
 
+	t.Cleanup(func() {
+		server.Close()
+	})
+
 	s.CreateStream("topics")
 
 	events := make(chan *sse.Event)
@@ -1107,7 +1144,7 @@ func newTestRelay(t *testing.T, slot uint64, genesisMocks map[string]http.Handle
 
 	beacon := NewMultiBeacon([]string{beaconSrv.URL})
 
-	s, err := NewRelay(store, beacon, known, active, duty, evtSender, cfg, genesis, true, 60, time.Duration(0), 10000000, false, false, trace.NewNoopTracerProvider().Tracer("relay"))
+	s, err := NewRelay(store, beacon, known, active, duty, evtSender, cfg, genesis, true, 60, time.Duration(0), 10000000, false, false, 10*1024*1024, trace.NewNoopTracerProvider().Tracer("relay"))
 	require.NoError(t, err)
 
 	t.Cleanup(func() {

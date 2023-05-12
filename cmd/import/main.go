@@ -73,7 +73,7 @@ func main() {
 			defer zap.L().Sync() // nolint:errcheck
 			logger.SetVersion(c.String("sha-version"))
 
-			var sqlVersion uint64 = 2
+			var sqlVersion uint64 = 1
 			dir := c.String("db-dir")
 			prefix := c.String("db-prefix")
 			dbPrefix := filepath.Join(c.String("db-dir"), c.String("db-prefix"))
