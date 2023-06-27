@@ -12,17 +12,21 @@ package freelay
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/pprof"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/NYTimes/gziphandler"
+	"github.com/cockroachdb/pebble"
+	"github.com/gorilla/mux"
 
 	builderapi "github.com/attestantio/go-builder-client/api"
 	buildercapella "github.com/attestantio/go-builder-client/api/capella"
@@ -36,9 +40,7 @@ import (
 	gethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/types"
-	"github.com/julienschmidt/httprouter"
 	"github.com/manifoldfinance/mev-freelay/logger"
-	"github.com/rs/cors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
@@ -46,118 +48,166 @@ import (
 )
 
 const (
-	SlotsPerEpoch           = 32
-	SecondsPerSlot          = 12
-	DurationPerSlot         = time.Second * SecondsPerSlot
-	DurationPerEpoch        = DurationPerSlot * time.Duration(SlotsPerEpoch)
-	activeValidatorTimespan = 3 * time.Hour
-
-	getPayloadRetryMS = 100
+	SlotsPerEpoch          = 32
+	SecondsPerSlot         = 12
+	DurationPerSlot        = time.Second * SecondsPerSlot
+	DurationPerEpoch       = DurationPerSlot * time.Duration(SlotsPerEpoch)
+	registeredValidatorTTL = 30 // seconds
 )
 
 var (
-	ethV1BuilderSlotRgx    = regexp.MustCompile("^[0-9]+$")
-	ethV1BuilderHashRgx    = regexp.MustCompile("^0x[a-fA-F0-9]+$")
 	ignoreGetHeaderHeaders = []string{"mev-boost/v1.5.0 Go-http-client/1.1"}
 )
 
 type Relay interface {
-	HTTPServer(addr string, readTimeout, readHeadTimeout, writeTimeout, idleTimeout uint64) *http.Server
+	HTTPServer(addr string, readTimeout, readHeadTimeout, writeTimeout, idleTimeout, maxHeaderBytes uint64) *http.Server
+	Stop()
 }
 
 type relay struct {
-	store                       StoreSetter
-	beacon                      MultiBeacon
-	knownValidator              KnownValidatorSetter
-	activeValidator             ActiveValidatorSetter
-	dutyState                   DutySetter
-	cfg                         *RelayConfig
-	evtSender                   EventSender
-	genesisTime                 uint64
-	pprofAPI                    bool
-	maxRateLimit                uint64
-	tracer                      trace.Tracer
-	traceIP                     bool
-	beaconProposeTimeout        time.Duration
-	cutOffTimeout               uint64
-	allowBuilderCancellations   bool
-	maxSubmitBlockBodySizeBytes uint64
+	ctx            context.Context
+	log            logger.Logger
+	store          StoreSetter
+	beacon         MultiBeacon
+	knownValidator KnownValidatorSetter
+	dutyState      DutySetter
+	cfg            *RelayConfig
+	evtSender      EventSender
+	genesisTime    uint64
+	maxRateLimit   uint64
+	tracer         trace.Tracer
+	traceIP        bool
 
-	headSlot             atomic.Uint64
-	isUpdatingPropDuties atomic.Bool
-	randaoState          *randaoState
-	withdrawalsState     *withdrawalsState
+	beaconProposeTimeout        time.Duration
+	cutOffTimeoutHeader         uint64
+	cutOffTimeoutPayload        uint64
+	maxSubmitBlockBodySizeBytes uint64
+	getPayloadRetryMax          uint64
+	getPayloadRetryMS           uint64
+
+	headSlot               atomic.Uint64
+	isUpdatingPropDuties   atomic.Bool
+	isRefreshingValidators atomic.Bool
+	isStopping             atomic.Bool
+	unblindInFlight        sync.WaitGroup
+
+	randaoState                 *randaoState
+	withdrawalsState            *withdrawalsState
+	latestDeliveredPayloadState *latestDeliveredPayloadState
+
+	builderBlockSimulator BuilderBlockSimulator
+
+	validatorCh chan SignedValidatorRegistrationExtended
 }
 
-func NewRelay(store StoreSetter, beacon MultiBeacon, known KnownValidatorSetter, active ActiveValidatorSetter, duty DutySetter, evtSender EventSender, cfg *RelayConfig, genesis uint64, pprofAPI bool, maxRateLimit uint64, beaconProposeTimeout time.Duration, cutOffTimeout uint64, traceIP, allowBuilderCancellations bool, maxSubmitBlockBodySizeBytes uint64, tracer trace.Tracer) (*relay, error) {
-	syncNode, err := beacon.BestSyncingNode()
+func NewRelay(
+	ctx context.Context,
+	store StoreSetter,
+	beacon MultiBeacon,
+	builderBlockSimulator BuilderBlockSimulator,
+	known KnownValidatorSetter,
+	duty DutySetter,
+	evtSender EventSender,
+	cfg *RelayConfig,
+	genesis, headSlot uint64,
+	maxChQueue, maxRateLimit, beaconProposeTimeout, cutOffTimeoutHeader, cutOffTimeoutPayload, maxSubmitBlockBodySizeBytes, getPayloadRetryMax, getPayloadRetryMS uint64,
+	traceIP bool,
+	tracer trace.Tracer,
+) (*relay, error) {
+	log := logger.WithValues("module", "relay")
+
+	// get latest delivered payload and set it to the latest delivered payload state
+	deliveredPayload, err := store.Delivered(ProposerPayloadQuery{
+		Limit: 1,
+	})
 	if err != nil {
-		return nil, err
+		log.Error(err, "failed to get latest delivered payload")
+	}
+	latestDeliveredState := newLatestDeliveredPayloadState()
+	if len(deliveredPayload) > 0 {
+		latestDeliveredState.Set(deliveredPayload[0].Slot, deliveredPayload[0].BlockHash)
 	}
 
 	r := &relay{
-		store:                       store,
-		beacon:                      beacon,
-		knownValidator:              known,
-		activeValidator:             active,
-		dutyState:                   duty,
-		cfg:                         cfg,
-		evtSender:                   evtSender,
-		genesisTime:                 genesis,
-		pprofAPI:                    pprofAPI,
-		maxRateLimit:                maxRateLimit,
-		tracer:                      tracer,
-		beaconProposeTimeout:        beaconProposeTimeout,
-		cutOffTimeout:               cutOffTimeout,
-		traceIP:                     traceIP,
-		allowBuilderCancellations:   allowBuilderCancellations,
+		ctx:            ctx,
+		log:            log,
+		store:          store,
+		beacon:         beacon,
+		knownValidator: known,
+		dutyState:      duty,
+		cfg:            cfg,
+		evtSender:      evtSender,
+		genesisTime:    genesis,
+		maxRateLimit:   maxRateLimit,
+		tracer:         tracer,
+		traceIP:        traceIP,
+
+		beaconProposeTimeout:        time.Duration(beaconProposeTimeout) * time.Millisecond,
+		cutOffTimeoutHeader:         cutOffTimeoutHeader,
+		cutOffTimeoutPayload:        cutOffTimeoutPayload,
+		getPayloadRetryMax:          getPayloadRetryMax,
+		getPayloadRetryMS:           getPayloadRetryMS,
 		maxSubmitBlockBodySizeBytes: maxSubmitBlockBodySizeBytes,
+
 		randaoState:                 newRandaoState(),
 		withdrawalsState:            newWithdrawalsState(),
+		latestDeliveredPayloadState: latestDeliveredState,
+		builderBlockSimulator:       builderBlockSimulator,
+
+		validatorCh: make(chan SignedValidatorRegistrationExtended, maxChQueue),
 	}
 
-	headSlot := syncNode.Data.HeadSlot
-	logger.Info("initial update proposer duties", "headSlot", headSlot)
-	if err := r.updateProposerDuties(headSlot); err != nil {
-		logger.Error(err, "failed to update proposer duties", "headSlot", headSlot)
-		return nil, err
-	}
-
-	logger.Info("processing current slot", "headSlot", headSlot)
+	log.Info("processing current slot", "headSlot", headSlot)
 	if err := r.processNewSlot(headSlot); err != nil {
-		logger.Error(err, "failed to process current slot", "headSlot", headSlot)
+		log.Error(err, "failed to process current slot", "headSlot", headSlot)
 	}
 
-	logger.Info("start refreshing known validators")
-	go r.startRefreshKnownValidators()
-
-	logger.Info("start loop processing of new slots")
+	log.Info("start loop processing of new slots")
 	go r.startLoopProcessNewSlot()
 
-	logger.Info("start loop to process new payload attributes")
+	log.Info("start loop to process new payload attributes")
 	go r.startLoopProcessPayloadAttributes()
 
-	logger.Info("start loop to cleanup active validators")
-	go r.startLoopCleanupActiveValidators()
+	log.Info("start parallel validator registration")
+	go r.startValidatorRegistration()
 
 	return r, nil
 }
 
-func (s *relay) HTTPServer(addr string, readTimeout, readHeadTimeout, writeTimeout, idleTimeout uint64) *http.Server {
-	mux := s.routes()
-	handler := cors.Default().Handler(mux)
+func (s *relay) HTTPServer(addr string, readTimeout, readHeadTimeout, writeTimeout, idleTimeout, maxHeaderBytes uint64) *http.Server {
+	mux := http.NewServeMux()
+	r := s.routes()
+
+	wrapped := wrapper(r)
+	rgzip := gziphandler.GzipHandler(wrapped)
+
+	mux.Handle("/", rgzip)
 
 	srv := http.Server{
 		Addr:    addr,
-		Handler: handler,
+		Handler: mux,
 
 		ReadTimeout:       time.Duration(readTimeout) * time.Millisecond,
 		ReadHeaderTimeout: time.Duration(readHeadTimeout) * time.Millisecond,
 		WriteTimeout:      time.Duration(writeTimeout) * time.Second,
 		IdleTimeout:       time.Duration(idleTimeout) * time.Second,
+		MaxHeaderBytes:    int(maxHeaderBytes),
 	}
 
 	return &srv
+}
+
+func (s *relay) Stop() {
+	if s.isStopping.Swap(true) {
+		return // already stopping
+	}
+
+	log := s.log.WithValues("method", "Stop")
+
+	log.Info("waiting for unblind in flight")
+	s.unblindInFlight.Wait()
+
+	log.Info("ready to be stopped")
 }
 
 // @contact.name   Manifold Finance, Inc.
@@ -170,69 +220,49 @@ func (s *relay) HTTPServer(addr string, readTimeout, readHeadTimeout, writeTimeo
 // @description Specification for the Freelay API.
 // @host localhost:50051
 // @BasePath /
-func (s *relay) routes() *httprouter.Router {
-	mux := httprouter.New()
+func (s *relay) routes() *mux.Router {
+	router := mux.NewRouter()
+
 	// root
-	mux.HandlerFunc(http.MethodGet, "/", wrapper(s.rootHandler()))
+	router.HandleFunc("/", s.rootHandler()).Methods(http.MethodGet)
 
 	// proposer endpoints
-	mux.HandlerFunc(http.MethodGet, "/eth/v1/builder/status", wrapper(s.statusHandler()))
-	mux.HandlerFunc(http.MethodPost, "/eth/v1/builder/validators", wrapper(s.registerValidatorHandler()))
-	mux.HandlerFunc(http.MethodGet, "/eth/v1/builder/header/:slot/:parentHash/:pubKey", wrapper(s.builderHeaderHandler()))
-	mux.HandlerFunc(http.MethodPost, "/eth/v1/builder/blinded_blocks", wrapper(s.unblindBlindedBlockHandler()))
+	router.HandleFunc("/eth/v1/builder/status", s.statusHandler()).Methods(http.MethodGet)
+	router.HandleFunc("/eth/v1/builder/validators", s.registerValidatorHandler()).Methods(http.MethodPost)
+	router.HandleFunc("/eth/v1/builder/header/{slot:[0-9]+}/{parentHash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}", s.builderHeaderHandler()).Methods(http.MethodGet)
+	router.HandleFunc("/eth/v1/builder/blinded_blocks", s.unblindBlindedBlockHandler()).Methods(http.MethodPost)
 
 	// builder endpoints
-	mux.HandlerFunc(http.MethodGet, "/relay/v1/builder/validators", wrapper(s.perEpochValidatorsHandler()))
-	mux.HandlerFunc(http.MethodPost, "/relay/v1/builder/blocks", wrapper(s.submitNewBlockHandler(newRateLimiter(s.maxRateLimit, DurationPerEpoch)))) // X requests per key
+	router.HandleFunc("/relay/v1/builder/validators", s.perEpochValidatorsHandler()).Methods(http.MethodGet)
+	router.HandleFunc("/relay/v1/builder/blocks", s.submitNewBlockHandler(NewRateLimiter(s.maxRateLimit, DurationPerEpoch))).Methods(http.MethodPost) // X requests per key
 
 	// data endpoints
-	mux.HandlerFunc(http.MethodGet, "/relay/v1/data/bidtraces/proposer_payload_delivered", wrapper(s.deliveredPayloadHandler()))
-	mux.HandlerFunc(http.MethodGet, "/relay/v1/data/bidtraces/builder_blocks_received", wrapper(s.submissionPayloadHandler()))
-	mux.HandlerFunc(http.MethodGet, "/relay/v1/data/validator_registration", wrapper(s.registeredValidatorHandler()))
+	router.HandleFunc("/relay/v1/data/bidtraces/proposer_payload_delivered", s.deliveredPayloadHandler()).Methods(http.MethodGet)
+	router.HandleFunc("/relay/v1/data/bidtraces/builder_blocks_received", s.submissionPayloadHandler()).Methods(http.MethodGet)
+	router.HandleFunc("/relay/v1/data/validator_registration", s.registeredValidatorHandler()).Methods(http.MethodGet)
 
-	// tracing endpoints
-	if s.pprofAPI {
-		mux.HandlerFunc(http.MethodGet, "/debug/pprof", pprof.Index)
-		mux.HandlerFunc(http.MethodGet, "/debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandlerFunc(http.MethodGet, "/debug/pprof/symbol", pprof.Symbol)
-		mux.HandlerFunc(http.MethodGet, "/debug/pprof/trace", pprof.Trace)
-		mux.HandlerFunc(http.MethodGet, "/debug/pprof/profile", pprof.Profile)
-		mux.HandlerFunc(http.MethodGet, "/debug/pprof/heap", pprof.Handler("heap").ServeHTTP)
-		mux.HandlerFunc(http.MethodGet, "/debug/pprof/goroutine", pprof.Handler("goroutine").ServeHTTP)
-		mux.HandlerFunc(http.MethodGet, "/debug/pprof/threadcreate", pprof.Handler("threadcreate").ServeHTTP)
-		mux.HandlerFunc(http.MethodGet, "/debug/pprof/block", pprof.Handler("block").ServeHTTP)
-	}
+	router.Use(mux.CORSMethodMiddleware(router))
 
-	mux.MethodNotAllowed = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		httpJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-	})
-
-	return mux
-}
-
-func (s *relay) startRefreshKnownValidators() {
-	ticker := time.NewTicker(DurationPerEpoch / 2)
-	for {
-		logger.Info("refreshing known validators")
-		if err := s.refreshKnownValidators(); err != nil {
-			logger.Error(err, "failed to refresh known validators")
-		}
-		<-ticker.C
-	}
+	return router
 }
 
 func (s *relay) startLoopProcessNewSlot() {
 	evt := make(chan HeadEvent)
 
-	logger.Info("subscribing to head events")
+	log := s.log.WithValues("method", "startLoopProcessNewSlot")
+
+	log.Info("subscribing to head events")
 	s.beacon.SubscribeToHeadEvents(evt)
 
-	for {
-		e := <-evt
-		logger.Info("received new head event", "headSlot", e.Slot)
-		if err := s.processNewSlot(e.Slot); err != nil {
-			logger.Error(err, "failed to process new slot", "headSlot", e.Slot)
+	for s.ctx.Err() == nil {
+		select {
+		case <-s.ctx.Done():
+			return
+		case e := <-evt:
+			log.Info("received new head event", "headSlot", e.Slot)
+			if err := s.processNewSlot(e.Slot); err != nil {
+				log.Error(err, "failed to process new slot", "headSlot", e.Slot)
+			}
 		}
 	}
 }
@@ -240,35 +270,44 @@ func (s *relay) startLoopProcessNewSlot() {
 func (s *relay) startLoopProcessPayloadAttributes() {
 	evt := make(chan PayloadAttributesEvent)
 
-	logger.Info("subscribing to payload attributes events")
+	log := s.log.WithValues("method", "startLoopProcessPayloadAttributes")
+
+	log.Info("subscribing to payload attributes events")
 	s.beacon.SubscribeToPayloadAttributesEvents(evt)
 
-	for {
-		e := <-evt
-		logger.Info("received new payload attributes event")
-		if err := s.processPayloadAttributes(e); err != nil {
-			logger.Error(err, "failed to process payload attributes")
+	for s.ctx.Err() == nil {
+		select {
+		case <-s.ctx.Done():
+			return
+		case e := <-evt:
+			log.Info("received new payload attributes event")
+			if err := s.processPayloadAttributes(e); err != nil {
+				log.Error(err, "failed to process payload attributes")
+			}
 		}
 	}
 }
 
-func (s *relay) startLoopCleanupActiveValidators() {
-	active, err := s.store.ActiveValidatorsStats()
-	if err != nil {
-		logger.Error(err, "failed to get active validator stats from store")
-	} else {
-		s.activeValidator.Set(active)
-	}
+func (s *relay) startValidatorRegistration() {
+	log := s.log.WithValues("method", "startValidatorRegistration")
 
-	ticker := time.NewTicker(DurationPerEpoch)
-	for {
-		logger.Info("cleaning up active validator stats")
-		s.activeValidator.ClearOld()
-		av := s.activeValidator.Get()
-		if err := s.store.SetActiveValidatorsStats(av); err != nil {
-			logger.Error(err, "failed to update active validator stats in store")
+	for v := range s.validatorCh {
+		if s.ctx.Err() != nil {
+			return
 		}
-		<-ticker.C
+
+		ok, err := types.VerifySignature(v.Message, s.cfg.DomainBuilder, v.Message.Pubkey[:], v.Signature[:])
+		if err != nil {
+			log.Error(err, "could not verify signature", "msg", v.Message, "signature", v.Signature, "pubkey", v.Message.Pubkey)
+			continue
+		} else if !ok {
+			log.Error(errors.New("invalid signature"), "invalid signature", "msg", v.Message, "signature", v.Signature, "pubkey", v.Message.Pubkey)
+			continue
+		}
+
+		if err := s.store.PutValidator(v.Message.Pubkey, v); err != nil {
+			log.Error(err, "failed to put validator", "pubkey", v.Message.Pubkey)
+		}
 	}
 }
 
@@ -281,7 +320,7 @@ func (s *relay) updateProposerDuties(headSlot uint64) error {
 	epochFrom := headSlot / uint64(SlotsPerEpoch)
 	epochTo := epochFrom + 1
 
-	log := logger.WithValues(
+	log := s.log.WithValues(
 		"method", "updateProposerDuties",
 		"headSlot", headSlot,
 		"epochFrom", epochFrom,
@@ -306,7 +345,7 @@ func (s *relay) updateProposerDuties(headSlot uint64) error {
 	for _, entry := range entries {
 		pubkey := new(types.PublicKey)
 		_ = pubkey.UnmarshalText([]byte(entry.Pubkey))
-		validator, err := s.store.RegisteredValidator(*pubkey)
+		validator, err := s.store.Validator(*pubkey)
 		if err != nil {
 			unregisteredValidators = append(unregisteredValidators, *pubkey)
 			continue
@@ -328,31 +367,49 @@ func (s *relay) updateProposerDuties(headSlot uint64) error {
 }
 
 func (s *relay) processNewSlot(headSlot uint64) error {
-	logger.Info("processing new slot", "headSlot", headSlot)
 	prevHeadSlot := s.headSlot.Load()
+	log := s.log.WithValues(
+		"method", "processNewSlot",
+		"headSlot", headSlot,
+		"prevHeadSlot", prevHeadSlot,
+		"receivedAt", time.Now().UTC(),
+	)
+
+	log.Info("processing new slot")
+
 	if headSlot <= prevHeadSlot {
 		return fmt.Errorf("slot %d is older than current head slot %d", headSlot, prevHeadSlot)
 	}
 
 	if prevHeadSlot > 0 {
 		for i := prevHeadSlot + 1; i < headSlot; i++ {
-			logger.Info("missed slot", "slot", i, "prevHeadSlot", prevHeadSlot, "headSlot", headSlot)
+			log.Info("missed slot", "slot", i, "prevHeadSlot", prevHeadSlot, "headSlot", headSlot)
 		}
 	}
 
 	s.headSlot.Store(headSlot)
 
 	go func() {
-		logger.Info("updating proposer duties", "headSlot", headSlot, "prevHeadSlot", prevHeadSlot)
+		log.Info("updating proposer duties")
 		if err := s.updateProposerDuties(headSlot); err != nil {
-			logger.Error(err, "failed to update proposer duties", "headSlot", headSlot, "prevHeadSlot", prevHeadSlot)
+			log.Error(err, "failed to update proposer duties")
 		}
 	}()
 
+	diffSlot := headSlot - s.knownValidator.LastSlot()
+	if diffSlot >= 6 {
+		go func() {
+			log.Info("refreshing known validators", "diffSlot", diffSlot)
+			if err := s.refreshKnownValidators(); err != nil {
+				log.Error(err, "failed to refresh known validators")
+			}
+		}()
+	}
+
 	go func() {
-		logger.Info("storing latest slot", "headSlot", headSlot, "prevHeadSlot", prevHeadSlot)
-		if err := s.store.SetLatestSlotStats(headSlot); err != nil {
-			logger.Error(err, "failed to store latest slot", "headSlot", headSlot, "prevHeadSlot", prevHeadSlot)
+		log.Info("updating latest slot")
+		if err := s.store.SetLatestSlot(headSlot); err != nil {
+			log.Error(err, "failed to update latest slot")
 		}
 	}()
 
@@ -367,62 +424,87 @@ func (s *relay) processPayloadAttributes(e PayloadAttributesEvent) error {
 		return fmt.Errorf("skipping old payload attributes: proposalSlot=%d headSlot=%d", proposalSlot, headSlot)
 	}
 
-	log := logger.WithValues(
+	parentBlockHash := e.Data.ParentBlockHash
+	log := s.log.WithValues(
 		"method", "processPayloadAttributes",
 		"proposalSlot", proposalSlot,
 		"headSlot", headSlot,
+		"parentBlockHash", parentBlockHash,
 	)
 
-	s.randaoState.mux.Lock()
-	defer s.randaoState.mux.Unlock()
-
-	prevRandao := e.Data.PayloadAttributes.PrevRandao
-	s.randaoState.expectedPrevRandao = &randaoHelper{
-		slot:       proposalSlot,
-		prevRandao: prevRandao,
+	currRandao := s.randaoState.ByHash(parentBlockHash)
+	currWithdrawals := s.withdrawalsState.ByHash(parentBlockHash)
+	if currRandao != nil && currWithdrawals != nil {
+		log.Info("skipping payload attributes", "parentBlockHash", parentBlockHash)
+		return nil
 	}
-	log.Info("updated expected randao", "prevRandao", prevRandao)
 
 	withdrawals := e.Data.PayloadAttributes.Withdrawals
 	root, err := computeWithdrawalsRoot(withdrawals)
 	if err != nil {
 		log.Error(err, "failed to compute withdrawals root")
+		return err
 	}
 
-	s.withdrawalsState.mux.Lock()
-	defer s.withdrawalsState.mux.Unlock()
+	s.randaoState.Cleanup(headSlot)
+	s.withdrawalsState.Cleanup(headSlot)
+	log.Info("cleaned up old randao and withdrawals")
 
-	s.withdrawalsState.expectedRoot = &withdrawalsHelper{
+	prevRandao := e.Data.PayloadAttributes.PrevRandao
+	s.randaoState.Put(parentBlockHash, &randaoHelper{
+		slot:       proposalSlot,
+		prevRandao: prevRandao,
+	})
+	log.Info("updated expected randao", "prevRandao", prevRandao)
+
+	s.withdrawalsState.Put(parentBlockHash, &withdrawalsHelper{
 		slot: proposalSlot,
 		root: root,
-	}
+	})
 	log.Info("updated expected withdrawals", "root", root)
 
 	return nil
 }
 
 func (s *relay) refreshKnownValidators() error {
-	validators, err := s.beacon.Validators(s.headSlot.Load())
+	if s.isRefreshingValidators.Swap(true) {
+		return nil
+	}
+	defer s.isRefreshingValidators.Store(false)
+
+	headSlot := s.headSlot.Load()
+
+	log := s.log.WithValues(
+		"method", "refreshKnownValidators",
+		"headSlot", headSlot,
+	)
+
+	log.Info("fetching validators")
+	ftime := time.Now().UTC()
+	validators, err := s.beacon.Validators(headSlot)
 	if err != nil {
 		return err
 	}
+	log.Info("fetched validators", "fetchValidatorsDur", time.Since(ftime))
 
-	vHexs := make(map[types.PubkeyHex]struct{})
+	vHexs := make(map[types.PubkeyHex]uint64)
 	vByIndx := make(map[uint64]types.PubkeyHex)
-	for _, v := range validators {
-		vHexs[types.NewPubkeyHex(v.Validator.Pubkey)] = struct{}{}
-		vByIndx[v.Index] = types.NewPubkeyHex(v.Validator.Pubkey)
+	for _, v := range validators.Data {
+		pk := types.NewPubkeyHex(v.Validator.Pubkey)
+		vHexs[pk] = v.Index
+		vByIndx[v.Index] = pk
 	}
 
-	s.knownValidator.Set(vHexs, vByIndx)
+	s.knownValidator.Set(vHexs, vByIndx, headSlot)
+	log.Info("set known validators")
+	s.knownValidator.Updated(true)
 
 	return nil
 }
 
 func (s *relay) rootHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("PBS Relay API")) //nolint:errcheck
+		httpResponse(w, http.StatusOK, "MEV Freelay API")
 	}
 }
 
@@ -449,10 +531,30 @@ func (s *relay) statusHandler() http.HandlerFunc {
 // @Router /eth/v1/builder/validators [post]
 func (s *relay) registerValidatorHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		log := logger.WithValues(
+		receivedAt := time.Now().UTC()
+		log := s.log.WithValues(
 			"method", "registerValidator",
 			"userAgent", r.UserAgent(),
+			"headSlot", s.headSlot.Load(),
+			"receivedAt", receivedAt,
 		)
+
+		if !s.knownValidator.IsUpdated() {
+			log.Error(errors.New("known validators are not updated"), "known validators are not updated")
+			httpJSONError(w, http.StatusInternalServerError, "known validators are not yet available")
+			return
+		}
+
+		_, span := s.tracer.Start(r.Context(), "registerValidator", trace.WithAttributes(attribute.Int("contentLength", int(r.ContentLength))))
+		defer span.End()
+
+		regTimestamp := uint64(time.Now().UTC().Unix() + 10)
+
+		if r.ContentLength == 0 {
+			log.Error(errors.New("empty request body"), "request body is empty")
+			httpJSONError(w, http.StatusBadRequest, "request body is empty")
+			return
+		}
 
 		p := make([]types.SignedValidatorRegistration, 0)
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
@@ -460,10 +562,8 @@ func (s *relay) registerValidatorHandler() http.HandlerFunc {
 			httpJSONError(w, http.StatusBadRequest, "failed to decode request body")
 			return
 		}
-		defer r.Body.Close() //nolint:errcheck
 
-		_, span := s.tracer.Start(r.Context(), "registerValidator", trace.WithAttributes(attribute.Int("numValidators", len(p))))
-		defer span.End()
+		total := len(p)
 
 		var ip string
 		if s.traceIP {
@@ -471,37 +571,36 @@ func (s *relay) registerValidatorHandler() http.HandlerFunc {
 		}
 
 		var (
-			numFailedRegistrations     uint64
-			numSuccessfulRegistrations uint64
-			numActiveValidators        uint64
+			numProcessedRegistrations uint64
+			errProcessedRegs          error
 		)
+
 		for _, v := range p {
+			pvp := time.Now().UTC()
+			t := v.Message.Timestamp
+			if t < s.genesisTime {
+				log.Info("timestamp is too far in the past", "pubkey", v.Message.Pubkey, "timestamp", t, "genesisTime", s.genesisTime)
+				errProcessedRegs = ErrValidatorTimestampTooFarInThePast
+				break
+			} else if t > regTimestamp {
+				log.Info("timestamp is too far in the future", "pubkey", v.Message.Pubkey, "timestamp", t, "regTimestamp", regTimestamp)
+				errProcessedRegs = ErrValidatorTimestampTooFarInTheFuture
+				break
+			}
+
 			ok := s.knownValidator.IsKnown(v.Message.Pubkey.PubkeyHex())
 			if !ok {
-				numFailedRegistrations++
 				log.Info("unknown validator", "pubkey", v.Message.Pubkey)
-				continue
+				errProcessedRegs = ErrValidatorUnknown
+				break
 			}
 
-			if v.Message.Timestamp > uint64(time.Now().Add(10*time.Second).Unix()) {
-				numFailedRegistrations++
-				log.Info("timestamp is too far in the future", "pubkey", v.Message.Pubkey)
-				continue
-			}
-
-			prevValidator, err := s.store.RegisteredValidator(v.Message.Pubkey)
+			prevValidator, err := s.store.ValidatorExtended(v.Message.Pubkey)
 			if err != nil {
-				log.Error(err, "failed to get validator", "pubkey", v.Message.Pubkey)
-			} else if prevValidator.Message.Timestamp >= v.Message.Timestamp {
-				numActiveValidators++
-				s.activeValidator.Put(v.Message.Pubkey)
+				log.Error(err, "failed to get validator", "pubkey", v.Message.Pubkey, "dur", time.Since(pvp))
+			} else if prevValidator.Message.Timestamp >= t {
 				continue
-			}
-
-			ok, err = types.VerifySignature(v.Message, s.cfg.DomainBuilder, v.Message.Pubkey[:], v.Signature[:])
-			if !ok || err != nil {
-				numFailedRegistrations++
-				log.Error(err, "invalid signature", "msg", v.Message, "signature", v.Signature, "pubkey", v.Message.Pubkey)
+			} else if prevValidator.Timestamp.Unix()+registeredValidatorTTL > time.Now().UTC().Unix() && prevValidator.Message.FeeRecipient == v.Message.FeeRecipient && prevValidator.Message.GasLimit == v.Message.GasLimit {
 				continue
 			}
 
@@ -510,31 +609,23 @@ func (s *relay) registerValidatorHandler() http.HandlerFunc {
 				IP:                          ip,
 				Timestamp:                   time.Now().UTC(),
 			}
-			if err := s.store.PutRegistrationValidator(v.Message.Pubkey, validatorExtended); err != nil {
-				numFailedRegistrations++
-				log.Error(err, "failed to put validator", "pubkey", v.Message.Pubkey)
-				continue
+
+			numProcessedRegistrations++
+
+			select {
+			case s.validatorCh <- validatorExtended:
+			default:
+				log.Error(ErrValidatorChanRegsFull, "failed to put validators on channel")
 			}
-
-			numSuccessfulRegistrations++
-			s.activeValidator.Put(v.Message.Pubkey)
 		}
 
-		log.Info("registered validators", "processed", len(p), "successful", numSuccessfulRegistrations, "active", numActiveValidators, "failed", numFailedRegistrations)
-
-		if numSuccessfulRegistrations == 0 && numActiveValidators == 0 {
-			log.Info("failed to register or validate any validators", "processed", len(p), "successful", numSuccessfulRegistrations, "active", numActiveValidators, "failed", numFailedRegistrations)
-			httpJSONError(w, http.StatusBadRequest, "failed to register any validators")
+		if errProcessedRegs != nil {
+			log.Error(errProcessedRegs, "failed to process registrations", "total", total, "processed", numProcessedRegistrations)
+			httpJSONError(w, http.StatusBadRequest, errProcessedRegs.Error())
 			return
 		}
 
-		if numFailedRegistrations > 0 {
-			log.Info("failed to register some validators", "processed", len(p), "successful", numSuccessfulRegistrations, "active", numActiveValidators, "failed", numFailedRegistrations)
-			httpJSONError(w, http.StatusBadRequest, "failed to register some validators")
-			return
-		}
-
-		log.Info("successful registration", "processed", len(p), "successful", numSuccessfulRegistrations, "active", numActiveValidators, "failed", numFailedRegistrations)
+		log.Info("successful registration", "total", total)
 		w.WriteHeader(http.StatusOK)
 	}
 }
@@ -555,53 +646,22 @@ func (s *relay) builderHeaderHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		receivedAt := time.Now().UTC()
 		ua := r.UserAgent()
-
-		log := logger.WithValues(
+		headSlot := s.headSlot.Load()
+		log := s.log.WithValues(
 			"method", "getHeader",
 			"userAgent", ua,
 			"path", r.URL.Path,
+			"headSlot", headSlot,
 			"receivedAt", receivedAt,
 		)
-
-		if slices.Contains(ignoreGetHeaderHeaders, ua) {
-			log.Info("ignoring mev-boost/v1.5.0")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		hReceivedAt := r.Header.Get("X-Req-Received-At")
-		if hReceivedAt != "" {
-			milli, err := strconv.ParseInt(hReceivedAt, 10, 64)
-			if err == nil {
-				receivedAt = time.UnixMilli(milli).UTC()
-			} else {
-				log.Error(err, "failed to parse received at header")
-			}
-		} else {
-			log.Info("received at header not found")
-		}
-
-		log = log.WithValues("receivedAt", receivedAt)
 
 		_, span := s.tracer.Start(r.Context(), "getHeader", trace.WithAttributes(attribute.String("pth", r.URL.Path)))
 		defer span.End()
 
-		params := httprouter.ParamsFromContext(r.Context())
-		slotStr := params.ByName("slot")
-		parentHashStr := params.ByName("parentHash")
-		pubKeyStr := params.ByName("pubKey")
-
-		if slotStr == "" || parentHashStr == "" || pubKeyStr == "" {
-			log.Error(errors.New("invalid path"), "url path is invalid", "path", r.URL.Path)
-			httpJSONError(w, http.StatusBadRequest, "invalid path")
-			return
-		}
-
-		if !ethV1BuilderSlotRgx.MatchString(slotStr) || !ethV1BuilderHashRgx.MatchString(parentHashStr) || !ethV1BuilderHashRgx.MatchString(pubKeyStr) {
-			log.Error(errors.New("invalid path format"), "url path format is invalid", "slot", slotStr)
-			httpJSONError(w, http.StatusBadRequest, "invalid path format")
-			return
-		}
+		params := mux.Vars(r)
+		slotStr := params["slot"]
+		parentHash := params["parentHash"]
+		pubkey := params["pubkey"]
 
 		slot, err := strconv.ParseUint(slotStr, 10, 64)
 		if err != nil {
@@ -610,39 +670,40 @@ func (s *relay) builderHeaderHandler() http.HandlerFunc {
 			return
 		}
 
-		parentHash := new(types.Hash)
-		err = parentHash.UnmarshalText([]byte(strings.ToLower(parentHashStr)))
-		if err != nil || len(parentHashStr) != 66 {
-			log.Error(err, "invalid parent hash", "parentHash", parentHashStr)
+		if len(parentHash) != 66 {
+			log.Error(err, "invalid parent hash", "parentHash", parentHash)
 			httpJSONError(w, http.StatusBadRequest, "invalid parent hash")
 			return
 		}
 
-		pubkey := new(types.PublicKey)
-		err = pubkey.UnmarshalText([]byte(strings.ToLower(pubKeyStr)))
-		if err != nil || len(pubKeyStr) != 98 {
-			log.Error(err, "invalid pubkey", "pubkey", pubKeyStr)
+		if len(pubkey) != 98 {
+			log.Error(err, "invalid pubkey", "pubkey", pubkey)
 			httpJSONError(w, http.StatusBadRequest, "invalid pubkey")
 			return
 		}
 
-		headSlot := s.headSlot.Load()
 		if slot < headSlot {
 			log.Error(errors.New("slot is too old"), "provided slot is too old", "slot", slot, "headSlot", headSlot)
 			httpJSONError(w, http.StatusBadRequest, "slot is too old")
 			return
 		}
 
-		slotStart := (s.genesisTime + slot*SecondsPerSlot) * 1000
-		timeIntoSlot := receivedAt.UnixMilli() - int64(slotStart)
-		if s.cutOffTimeout > 0 && timeIntoSlot > int64(s.cutOffTimeout) {
-			log.Error(errors.New("too late to get header"), "too late to get header", "timeIntoSlot", timeIntoSlot, "cutOffTimeout", s.cutOffTimeout)
-			httpJSONError(w, http.StatusBadRequest, "too late to get header")
+		if slices.Contains(ignoreGetHeaderHeaders, ua) {
+			log.Info("ignoring mev-boost/v1.5.0")
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
-		bid, err := s.store.BestBid(slot, *parentHash, *pubkey)
-		if err != nil && err != ErrBestBidNotFound {
+		slotStart := (s.genesisTime + slot*SecondsPerSlot) * 1000
+		timeIntoSlot := receivedAt.UnixMilli() - int64(slotStart)
+		if s.cutOffTimeoutHeader > 0 && timeIntoSlot > int64(s.cutOffTimeoutHeader) {
+			log.Info("too late to get header", "timeIntoSlot", timeIntoSlot, "cutOffTimeout", s.cutOffTimeoutHeader)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		bid, err := s.store.BestBid(slot, parentHash, pubkey)
+		if err != nil && err != pebble.ErrNotFound {
 			log.Error(err, "failed to get bid")
 			httpJSONError(w, http.StatusBadRequest, "failed to get bid")
 			return
@@ -685,26 +746,16 @@ func (s *relay) builderHeaderHandler() http.HandlerFunc {
 // @Router /eth/v1/builder/blinded_blocks [post]
 func (s *relay) unblindBlindedBlockHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		s.unblindInFlight.Add(1)
+		defer s.unblindInFlight.Done()
 		receivedAt := time.Now().UTC()
-		log := logger.WithValues(
+
+		log := s.log.WithValues(
 			"method", "getPayload",
 			"userAgent", r.UserAgent(),
+			"headSlot", s.headSlot.Load(),
 			"receivedAt", receivedAt,
 		)
-
-		hReceivedAt := r.Header.Get("X-Req-Received-At")
-		if hReceivedAt != "" {
-			milli, err := strconv.ParseInt(hReceivedAt, 10, 64)
-			if err == nil {
-				receivedAt = time.UnixMilli(milli).UTC()
-			} else {
-				log.Error(err, "failed to parse received at header")
-			}
-		} else {
-			log.Info("received at header not found")
-		}
-
-		log = log.WithValues("receivedAt", receivedAt)
 
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -712,7 +763,6 @@ func (s *relay) unblindBlindedBlockHandler() http.HandlerFunc {
 			httpJSONError(w, http.StatusBadRequest, "failed to read body")
 			return
 		}
-		defer r.Body.Close() // nolint:errcheck
 
 		payload := new(SignedBlindedBeaconBlock)
 		capellaPayload := new(apicapella.SignedBlindedBeaconBlock)
@@ -730,6 +780,7 @@ func (s *relay) unblindBlindedBlockHandler() http.HandlerFunc {
 		log = log.WithValues(
 			"slot", payload.Slot(),
 			"blockHash", payload.BlockHash(),
+			"proposerIndex", payload.ProposerIndex(),
 			"query", r.URL.RawQuery,
 		)
 
@@ -764,23 +815,23 @@ func (s *relay) unblindBlindedBlockHandler() http.HandlerFunc {
 			return
 		}
 
+		log = log.WithValues("pubkey", pubKey)
+
 		var (
 			exErr  error
 			res    *GetPayloadResponse
-			ticker = time.NewTicker(time.Duration(getPayloadRetryMS) * time.Millisecond)
+			ticker = time.NewTicker(time.Duration(s.getPayloadRetryMS) * time.Millisecond)
 		)
-		for i := 0; i < 3; i++ {
-			res, exErr = s.store.ExecutedPayload(payload.Slot(), pubKey, payload.BlockHash())
+		for i := 0; i < int(s.getPayloadRetryMax); i++ {
+			res, exErr = s.store.Executed(payload.Slot(), pubKey, payload.BlockHash())
 			if exErr == nil {
 				break
 			}
-			log.Info("retrying to get executed payload after 100ms because sometimes we get fetching for executed data even before it is written in the DB", "retry", i)
-			// retry 3 times with 100ms delay in 2 attempts because sometimes we get fetching for executed data even before it is written in the DB
-			if i == 2 {
-				break
-			}
+			log.Info("retrying to get executed payload because sometimes we get fetching for executed data even before it is written in the DB", "retry", i, "timeout", s.getPayloadRetryMS)
+			// retry getPayloadRetryMax times with X delay in getPayloadRetryMax-1 attempts because sometimes we get fetching for executed data even before it is written in the DB
 			<-ticker.C
 		}
+		ticker.Stop()
 
 		if exErr != nil {
 			log.Error(exErr, "failed to get executed payload")
@@ -788,23 +839,78 @@ func (s *relay) unblindBlindedBlockHandler() http.HandlerFunc {
 			return
 		}
 
-		lastSlot, err := s.store.LatestDeliveredSlotStats()
-		if err != nil {
-			log.Error(err, "failed to get last delivered slot")
-		} else if payload.Slot() <= lastSlot {
+		log.Info("found executed payload", "slot", payload.Slot(), "blockHash", payload.BlockHash())
+
+		lastSlot, lastHash := s.latestDeliveredPayloadState.Get()
+		if payload.Slot() < lastSlot {
 			log.Error(errors.New("slot was already delivered"), "slot", payload.Slot(), "lastSlot", lastSlot)
 			httpJSONError(w, http.StatusBadRequest, "slot was already delivered")
 			return
+		} else if payload.Slot() == lastSlot && lastHash != nil && payload.BlockHash() != *lastHash {
+			log.Error(errors.New("payload already delivered for slot with a different block hash"), "blockHash", payload.BlockHash(), "lastHash", lastHash)
+			httpJSONError(w, http.StatusBadRequest, "payload already delivered for slot with a different hash")
+			return
 		}
 
-		go func() {
-			if err := s.store.SetLatestDeliveredSlotStats(payload.Slot()); err != nil {
-				log.Error(err, "failed to set latest slot stats")
-			}
-		}()
+		s.latestDeliveredPayloadState.Set(payload.Slot(), payload.BlockHash())
+
+		var (
+			errMissed, errDelivered error
+			bidTrace                *BidTrace
+			ip                      string
+		)
+
+		if s.traceIP {
+			ip = userIP(r)
+		}
 
 		slotStart := (s.genesisTime + payload.Slot()*SecondsPerSlot) * 1000
 		timeIntoSlot := receivedAt.UnixMilli() - int64(slotStart)
+
+		log = log.WithValues("timeIntoSlot", timeIntoSlot, "cutOffTimeout", s.cutOffTimeoutPayload, "slotStart", slotStart)
+
+		defer func() {
+			log.Info("upserting unblinded block", "errDelivered", errDelivered, "errMissed", errMissed)
+
+			if errDelivered == nil {
+				if err := s.store.PutDelivered(DeliveredPayload{
+					BidTrace:                 *bidTrace,
+					SignedBlindedBeaconBlock: payload,
+					Timestamp:                receivedAt,
+					IP:                       ip,
+				}); err != nil {
+					log.Error(err, "failed to put unblind data")
+					return
+				}
+
+				if err := s.store.UpsertBuilderDelivered(bidTrace.BuilderPubkey, bidTrace.Slot, payloadID(bidTrace.BlockHash.String(), bidTrace.Slot, bidTrace.ProposerPubkey.String())); err != nil {
+					log.Error(err, "failed to upsert block builder delivered")
+				}
+
+				if err := s.evtSender.SendBlockUnblindedEvent(
+					bidTrace.Slot,
+					gethcommon.Hash(bidTrace.BlockHash),
+					bidTrace.Value.BigInt(),
+				); err != nil {
+					log.Error(err, "failed to send block unblinded event to event bus")
+				}
+			} else if errMissed == nil {
+				if err := s.store.PutMissed(MissedPayload{
+					TimeIntoSlot:   timeIntoSlot,
+					Timestamp:      receivedAt,
+					SlotStart:      slotStart,
+					Slot:           payload.Slot(),
+					BlockHash:      payload.BlockHash(),
+					ProposerPubkey: pubKey,
+					IP:             ip,
+					Error:          errMissed.Error(),
+					DeliveredError: errDelivered.Error(),
+				}); err != nil {
+					log.Error(err, "failed to put missed data")
+				}
+			}
+		}()
+
 		if timeIntoSlot < 0 {
 			earlyMS := time.Now().UTC().UnixMilli() - int64(slotStart)
 			if earlyMS < 0 {
@@ -813,23 +919,15 @@ func (s *relay) unblindBlindedBlockHandler() http.HandlerFunc {
 				log.Info("delaying unblinding block because it is too early")
 				time.Sleep(time.Duration(delayMS) * time.Millisecond)
 			}
-		} else if s.cutOffTimeout > 0 && timeIntoSlot > int64(s.cutOffTimeout) {
-			log.Error(errors.New("too late to unblind block"), "too late to unblind block", "timeIntoSlot", timeIntoSlot, "cutOffTimeout", s.cutOffTimeout)
+		} else if s.cutOffTimeoutPayload > 0 && timeIntoSlot > int64(s.cutOffTimeoutPayload) {
+			errMissed = ErrMissedBlock
+			log.Error(ErrMissedBlock, "too late to unblind block")
 			httpJSONError(w, http.StatusBadRequest, "too late to unblind block")
-
-			go func() {
-				if err := s.store.PutMissedPayload(payload.Slot(), pubKey, payload.BlockHash(), MissedPayload{
-					TimeIntoSlot: timeIntoSlot,
-					Timestamp:    receivedAt,
-					SlotStart:    slotStart,
-				}); err != nil {
-					log.Error(err, "failed to put missed payload")
-				}
-			}()
 			return
 		}
 
 		if err := compareExecutionHeaderPayload(payload, res); err != nil {
+			errDelivered = err
 			log.Error(err, "failed to compare execution header and payload")
 			httpJSONError(w, http.StatusBadRequest, "failed to compare execution header and payload")
 			return
@@ -837,7 +935,11 @@ func (s *relay) unblindBlindedBlockHandler() http.HandlerFunc {
 
 		unblindedBlock := unblindedSignedBeaconBlock(payload, res)
 		startTime := time.Now().UTC()
+
+		log = log.WithValues("startTimePublishBlock", startTime)
+
 		if err := s.beacon.PublishBlock(unblindedBlock); err != nil {
+			errDelivered = err
 			log.Error(err, "failed to publish block")
 			httpJSONError(w, http.StatusBadRequest, "failed to publish block")
 			return
@@ -846,46 +948,18 @@ func (s *relay) unblindBlindedBlockHandler() http.HandlerFunc {
 		log.Info("block published", "slot", payload.Slot(), "blockHash", payload.BlockHash(), "duration", time.Since(startTime).Milliseconds())
 
 		// wait for the block to be propagate over other p2p nodes
-		time.Sleep(s.beaconProposeTimeout * time.Millisecond)
+		time.Sleep(s.beaconProposeTimeout)
 
-		var ip string
-		if s.traceIP {
-			ip = userIP(r)
+		bt, err := s.store.BidTrace(payload.Slot(), pubKey, payload.BlockHash())
+		if err != nil {
+			errDelivered = err
+			log.Error(err, "failed to get bid trace")
+			httpJSONError(w, http.StatusBadRequest, "failed to get bid trace")
+			return
 		}
-		go func() {
-			bidTrace, err := s.store.BidTrace(payload.Slot(), pubKey, payload.BlockHash())
-			if err != nil {
-				log.Error(err, "failed to get bid trace payload")
-			} else {
-				log.Info("found bid trace", "bidTraceSlot", bidTrace.Slot, "bidTraceBlockHash", bidTrace.BlockHash, "bidTraceBuilderPubkey", bidTrace.BuilderPubkey, "bidTraceProposerPubkey", bidTrace.ProposerPubkey)
-				if err := s.store.PutDeliveredPayload(DeliveredPayload{
-					BidTrace:                 *bidTrace,
-					SignedBlindedBeaconBlock: payload,
-					Timestamp:                receivedAt,
-					IP:                       ip,
-				}); err != nil {
-					log.Error(err, "failed to put delivered payload")
-				}
+		bidTrace = bt
+		log.Info("unblinded a block", "block", payload.BlockNumber(), "numTransactions", res.NumTx(), "bidTraceSlot", bidTrace.Slot, "bidTraceBlockHash", bidTrace.BlockHash, "bidTraceBuilderPubkey", bidTrace.BuilderPubkey, "bidTraceProposerPubkey", bidTrace.ProposerPubkey)
 
-				if err := s.store.UpsertBlockBuilderDeliveredPayload(
-					bidTrace.BuilderPubkey,
-					bidTrace.Slot,
-					payloadID(bidTrace.BlockHash.String(), bidTrace.Slot, bidTrace.ProposerPubkey.String()),
-				); err != nil {
-					log.Error(err, "failed to upsert block builder delivered payload")
-				}
-
-				if err := s.evtSender.SendBlockUnblindedEvent(
-					payload.Slot(),
-					gethcommon.Hash(res.BlockHash()),
-					bidTrace.Value.BigInt(),
-				); err != nil {
-					log.Error(err, "failed to send block unblinded event to event bus")
-				}
-			}
-		}()
-
-		log.Info("received a block", "block", payload.BlockNumber(), "numTransactions", res.NumTx())
 		httpJSONResponse(w, http.StatusOK, res)
 	}
 }
@@ -912,64 +986,72 @@ func (s *relay) perEpochValidatorsHandler() http.HandlerFunc {
 // @Failure 400 {object} JSONError
 // @Failure 501 {object} JSONError
 // @Router /relay/v1/builder/blocks [post]
-func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
+func (s *relay) submitNewBlockHandler(limiter RateLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		receivedAt := time.Now().UTC()
 		allowCancellations := r.URL.Query().Get("cancellations") == "1"
 		contentType := r.Header.Get("Content-Type")
+		headSlot := s.headSlot.Load()
 
-		log := logger.WithValues(
+		log := s.log.WithValues(
 			"method", "submitNewBlock",
 			"userAgent", r.UserAgent(),
-			"receivedAt", receivedAt,
 			"allowCancellations", allowCancellations,
 			"contentType", contentType,
+			"headSlot", headSlot,
+			"receivedAt", receivedAt,
 		)
 
-		hReceivedAt := r.Header.Get("X-Req-Received-At")
-		if hReceivedAt != "" {
-			milli, err := strconv.ParseInt(hReceivedAt, 10, 64)
-			if err == nil {
-				receivedAt = time.UnixMilli(milli).UTC()
-			} else {
-				log.Error(err, "failed to parse received at header")
-			}
-		} else {
-			log.Info("received at header not found")
-		}
-
-		log = log.WithValues("receivedAt", receivedAt)
-
-		if allowCancellations && !s.allowBuilderCancellations {
+		if allowCancellations {
 			log.Error(errors.New("cancellations not allowed"), "cancellations not allowed")
 			httpJSONError(w, http.StatusBadRequest, "cancellations not allowed")
 			return
 		}
 
-		body, err := io.ReadAll(io.LimitReader(r.Body, int64(s.maxSubmitBlockBodySizeBytes)))
+		decodeT := time.Now().UTC()
+
+		var (
+			err    error
+			reader io.Reader = r.Body
+		)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			reader, err = gzip.NewReader(r.Body)
+			if err != nil {
+				log.Error(err, "failed to create gzip reader")
+				httpJSONError(w, http.StatusBadRequest, "failed to create gzip reader")
+				return
+			}
+		}
+
+		body, err := io.ReadAll(io.LimitReader(reader, int64(s.maxSubmitBlockBodySizeBytes)))
 		if err != nil {
 			log.Error(err, "failed to read body")
 			httpJSONError(w, http.StatusBadRequest, "failed to read body")
 			return
 		}
-		defer r.Body.Close() // nolint:errcheck
 
 		payload := new(BuilderSubmitBlockRequest)
 		if contentType == "application/octet-stream" {
-			payloadCapella := new(buildercapella.SubmitBlockRequest)
-			if err := payloadCapella.UnmarshalSSZ(body); err != nil {
+			payload.Capella = new(buildercapella.SubmitBlockRequest)
+			if err := payload.Capella.UnmarshalSSZ(body); err != nil {
 				log.Error(err, "failed to unmarshal ssz payload")
-			} else {
-				payload.Capella = payloadCapella
-			}
-		}
 
-		if payload == nil || payload.Capella == nil {
-			if err := json.Unmarshal(body, &payload); err != nil {
-				log.Error(err, "failed to unmarshal json payload")
-				httpJSONError(w, http.StatusBadRequest, "invalid body")
-				return
+				if err := json.Unmarshal(body, &payload); err != nil {
+					log.Error(err, "failed to unmarshal json payload as well")
+					httpJSONError(w, http.StatusBadRequest, "invalid body")
+					return
+				}
+
+				log = log.WithValues("decoded", "json")
+			} else {
+				log = log.WithValues("decoded", "ssz")
 			}
+		} else if err := json.Unmarshal(body, &payload); err != nil {
+			log.Error(err, "failed to unmarshal json payload")
+			httpJSONError(w, http.StatusBadRequest, "invalid body")
+			return
+		} else {
+			log = log.WithValues("decoded", "json")
 		}
 
 		if payload.IsEmpty() {
@@ -997,23 +1079,12 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 			"slot", payloadBidTrace.Slot,
 			"builderPubkey", payloadBidTrace.BuilderPubkey,
 			"blockHash", payloadBidTrace.BlockHash,
+			"proposerPubKey", payloadBidTrace.ProposerPubkey,
+			"parentHash", payloadBidTrace.ParentHash,
+			"decodeDur", time.Since(decodeT),
 		)
 
-		// reject submissions of builders that are unknown to us for the time being
-		accepted, err := s.store.AreNewBlockBuildersAccepted()
-		if err != nil {
-			log.Error(err, "failed to check if new block builders are accepted")
-		} else if !accepted {
-			known, err := s.store.IsKnownBlockBuilder(payloadBidTrace.BuilderPubkey)
-			if !known || err != nil {
-				log.Error(err, "pausing submission of unknown block builder", "builderPubkey", payloadBidTrace.BuilderPubkey)
-				httpJSONError(w, http.StatusBadRequest, "pausing submission of unknown block builders")
-				return
-			}
-		}
-
 		rlKey := fmt.Sprintf("%s_%d", payloadBidTrace.BuilderPubkey.String(), payloadBidTrace.Slot)
-
 		if err := limiter.Wait(r.Context(), rlKey); err != nil {
 			defer limiter.Close(rlKey)
 			log.Error(errors.New("rate limit exceeded"), "no empty slots", "slot", payloadBidTrace.Slot, "builderPubkey", payloadBidTrace.BuilderPubkey)
@@ -1022,7 +1093,6 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 		}
 		defer limiter.Close(rlKey)
 
-		headSlot := s.headSlot.Load()
 		if payloadBidTrace.Slot <= headSlot {
 			log.Error(errors.New("slot is older"), "payloads slot is too old", "headSlot", headSlot, "payloadSlot", payloadBidTrace.Slot)
 			httpJSONError(w, http.StatusBadRequest, "slot is too old")
@@ -1041,15 +1111,13 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 			log.Error(errors.New("nil slot duty"), "no proposed slot duty found")
 			httpJSONError(w, http.StatusBadRequest, "no slot duty")
 			return
-		}
-
-		if !strings.EqualFold(slotDuty.Entry.Message.FeeRecipient.String(), payloadBidTrace.ProposerFeeRecipient.String()) {
+		} else if !strings.EqualFold(slotDuty.Entry.Message.FeeRecipient.String(), payloadBidTrace.ProposerFeeRecipient.String()) {
 			log.Error(errors.New("fee recipient mismatch"), "slot duty and proposer fee recipient mismatch", "expected", slotDuty.Entry.Message.FeeRecipient, "actual", payloadBidTrace.ProposerFeeRecipient)
 			httpJSONError(w, http.StatusBadRequest, "fee recipient mismatch")
 			return
 		}
 
-		builder, err := s.store.BlockBuilder(payloadBidTrace.BuilderPubkey)
+		builder, err := s.store.Builder(payloadBidTrace.BuilderPubkey)
 		if err != nil {
 			log.Error(err, "failed to get block builder status")
 		}
@@ -1061,8 +1129,6 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 		}
 
 		log = log.WithValues(
-			"proposerPubKey", payloadBidTrace.ProposerPubkey,
-			"parentHash", payloadBidTrace.ParentHash,
 			"value", payload.Value(),
 			"tx", payload.NumTx(),
 		)
@@ -1074,17 +1140,15 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 		}
 
 		if payloadBidTrace.BlockHash != payload.ExecutionPayloadBlockHash() || payloadBidTrace.ParentHash != payload.ExecutionPayloadParentHash() {
-			log.Error(errors.New("block hash mismatch"), "block hash and parenthash mismatch", "blockHash", payloadBidTrace.BlockHash, "parentHash", payloadBidTrace.ParentHash, "payloadBlockHash", payload.ExecutionPayloadBlockHash(), "payloadParentHash", payload.ExecutionPayloadParentHash())
-			httpJSONError(w, http.StatusBadRequest, "block hash and parenthash mismatch")
+			log.Error(errors.New("block hash mismatch"), "block hash and parent hash mismatch", "blockHash", payloadBidTrace.BlockHash, "parentHash", payloadBidTrace.ParentHash, "payloadBlockHash", payload.ExecutionPayloadBlockHash(), "payloadParentHash", payload.ExecutionPayloadParentHash())
+			httpJSONError(w, http.StatusBadRequest, "block hash and parent hash mismatch")
 			return
 		}
 
-		s.randaoState.mux.RLock()
-		randao := s.randaoState.expectedPrevRandao
-		s.randaoState.mux.RUnlock()
-		if payloadBidTrace.Slot != randao.slot {
-			log.Error(errors.New("slot mismatch"), "prev randao is not updated yet", "randaoSlot", randao.slot, "payloadSlot", payloadBidTrace.Slot)
-			httpJSONError(w, http.StatusInternalServerError, "prev randao is not updated yet")
+		randao := s.randaoState.ByHash(payloadBidTrace.ParentHash.String())
+		if randao == nil || payloadBidTrace.Slot != randao.slot {
+			log.Error(errors.New("slot mismatch"), "payload attributes not updated yet", "randao", randao, "payloadSlot", payloadBidTrace.Slot)
+			httpJSONError(w, http.StatusInternalServerError, "payload attributes not updated yet")
 			return
 		}
 		if payload.ExecutionPayloadRandom().String() != randao.prevRandao {
@@ -1093,29 +1157,32 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 			return
 		}
 
-		withdrawals := payload.Withdrawals()
-		if withdrawals != nil {
-			s.withdrawalsState.mux.RLock()
-			expectedRoot := s.withdrawalsState.expectedRoot
-			s.withdrawalsState.mux.RUnlock()
-			if expectedRoot.slot != payloadBidTrace.Slot {
-				log.Info("unknown withdrawals at the moment")
-				httpJSONError(w, http.StatusInternalServerError, "withdrawals are not known yet")
-				return
-			}
-			root, err := computeWithdrawalsRoot(withdrawals)
-			if err != nil {
-				log.Error(err, "could not compute withdrawals root from payload")
-				httpJSONError(w, http.StatusBadRequest, "could not compute withdrawals root")
-				return
-			}
-			if expectedRoot.root != root {
-				log.Info("incorrect withdrawals root", "got", root, "expected", expectedRoot.root)
-				httpJSONError(w, http.StatusBadRequest, "incorrect withdrawals root")
-				return
-			}
+		expectedRoot := s.withdrawalsState.ByHash(payloadBidTrace.ParentHash.String())
+		if expectedRoot == nil || expectedRoot.slot != payloadBidTrace.Slot {
+			log.Error(errors.New("slot mismatch"), "payload withdrawals not updated yet", "expectedRoot", expectedRoot, "payloadSlot", payloadBidTrace.Slot)
+			httpJSONError(w, http.StatusInternalServerError, "payload withdrawals not updated yet")
+			return
+		}
+		root, err := computeWithdrawalsRoot(payload.Withdrawals())
+		if err != nil {
+			log.Error(err, "could not compute withdrawals root from payload")
+			httpJSONError(w, http.StatusBadRequest, "could not compute withdrawals root")
+			return
+		}
+		if expectedRoot.root != root {
+			log.Info("incorrect withdrawals root", "got", root, "expected", expectedRoot.root)
+			httpJSONError(w, http.StatusBadRequest, "incorrect withdrawals root")
+			return
 		}
 
+		latestSlot, _ := s.latestDeliveredPayloadState.Get()
+		if payloadBidTrace.Slot <= latestSlot {
+			log.Error(errors.New("payload slot too old"), "payload already delivered, slot is too old", "latestSlot", latestSlot, "payloadSlot", payloadBidTrace.Slot)
+			httpJSONError(w, http.StatusBadRequest, "payload already delivered")
+			return
+		}
+
+		tsig := time.Now().UTC()
 		sig := payload.Signature()
 		ok, err := types.VerifySignature(payloadBidTrace, s.cfg.DomainBuilder, payloadBidTrace.BuilderPubkey[:], sig[:])
 		if !ok || err != nil {
@@ -1124,14 +1191,9 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 			return
 		}
 
-		latestSlot, err := s.store.LatestDeliveredSlotStats()
-		if err != nil {
-			log.Error(err, "latest slot stats not found")
-		} else if payloadBidTrace.Slot <= latestSlot {
-			log.Error(errors.New("payload slot too old"), "payload already delivered, slot is too old", "latestSlot", latestSlot, "payloadSlot", payloadBidTrace.Slot)
-			httpJSONError(w, http.StatusBadRequest, "payload already delivered")
-			return
-		}
+		log = log.WithValues("sigValidDur", time.Since(tsig))
+
+		// if we got to here means the payload is valid and we can start processing it
 
 		var ip string
 		if s.traceIP {
@@ -1165,38 +1227,34 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 				bidTraceExtended.SimError = simErr.Error()
 			}
 
-			if err := s.store.PutBuilderBlockSubmissionsPayload(bidTraceExtended); err != nil {
-				log.Error(err, "failed to store submission payload")
+			if err := s.store.PutSubmitted(bidTraceExtended); err != nil {
+				log.Error(err, "failed to put submitted block")
+				return
 			}
 
-			if err := s.store.UpsertBlockBuilderSubmissionPayload(
-				bidTraceExtended.BuilderPubkey,
-				bidTraceExtended.Slot,
-				payloadID(bidTraceExtended.BlockHash.String(), bidTraceExtended.Slot, bidTraceExtended.ProposerPubkey.String()),
-				simErr,
-			); err != nil {
-				log.Error(err, "failed to upsert block builder")
+			if err := s.store.UpsertBuilderSubmitted(bidTraceExtended.BuilderPubkey, bidTraceExtended.Slot, payloadID(bidTraceExtended.BlockHash.String(), bidTraceExtended.Slot, bidTraceExtended.ProposerPubkey.String()), simErr); err != nil {
+				log.Error(err, "failed to upsert block builder submitted")
 			}
 		}()
 
-		bestBid, err := s.store.BestBid(payloadBidTrace.Slot, payloadBidTrace.ParentHash, payloadBidTrace.ProposerPubkey)
+		bestBid, err := s.store.BestBid(payloadBidTrace.Slot, payloadBidTrace.ParentHash.String(), payloadBidTrace.ProposerPubkey.String())
 		if err != nil {
 			log.Error(err, "failed to get best bid")
 		} else {
 			log = log.WithValues("bestBid", bestBid.Value(), "submittedBid", payloadBidTrace.Value)
-
-			if !allowCancellations && bestBid != nil && payload.Value().Cmp(bestBid.Value()) < 1 {
-				simErr = errors.New("rejected bid because it is not better than the current best bid")
-				log.Info("bid is not better than the current best bid")
-				w.WriteHeader(http.StatusOK)
+			if bestBid != nil && payload.Value().Cmp(bestBid.Value()) < 1 {
+				simErr = errors.New("accepted bid but it is not validated because it is not better than the current best bid")
+				log.Info("accepted bid but it not validated because it is not better than the current best bid")
+				httpResponse(w, http.StatusAccepted, "accepted bid but it not validated because it is not better than the current best bid")
 				return
 			}
 		}
 
-		if err := simulateBlockSubmission(r.Context(), &BuilderBlockValidationRequest{
+		tsim := time.Now().UTC()
+		if err := s.builderBlockSimulator.SimulateBlockSubmission(r.Context(), &BuilderBlockValidationRequest{
 			BuilderSubmitBlockRequest: *payload,
 			RegisteredGasLimit:        slotDuty.Entry.Message.GasLimit,
-		}, s.cfg.BlockSimURL); err != nil {
+		}); err != nil {
 			simErr = err
 			log.Error(err, "failed to simulate block submission", "uri", s.cfg.BlockSimURLSafe, "timeDiff", time.Since(receivedAt))
 			httpJSONError(w, http.StatusBadRequest, "failed to simulate block submission")
@@ -1213,30 +1271,15 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 			return
 		}
 
-		log = log.WithValues("simDuration", time.Since(receivedAt))
+		log = log.WithValues("simDur", time.Since(tsim))
 
 		log.Info("builder block submission simulated successfully")
-
-		if allowCancellations {
-			latestBuilderBid, err := s.store.LatestBuilderBid(payloadBidTrace.Slot, payloadBidTrace.ParentHash, payloadBidTrace.ProposerPubkey, payloadBidTrace.BuilderPubkey)
-			if err != nil {
-				log.Error(err, "failed to get latest builder bid")
-			} else if latestBuilderBid != nil && uint64(receivedAt.UnixMilli()) < uint64(latestBuilderBid.Timestamp.UnixMilli()) {
-				log.Error(errors.New("bid too old"), "bid is not the latest", "latest", latestBuilderBid.Timestamp.UnixMilli(), "received", receivedAt.UnixMilli())
-				httpJSONError(w, http.StatusBadRequest, "bid is not the latest")
-				return
-			}
-		}
 
 		getHeaderResponse, err := buildGetHeaderResponse(payload, s.cfg.SecretKey, s.cfg.PublicKey, s.cfg.DomainBuilder)
 		if err != nil {
 			log.Error(err, "failed to build get header response")
 			httpJSONError(w, http.StatusBadRequest, "failed to build get header response")
 			return
-		}
-		builderBidHeaderResponse := BuilderBidHeaderResponse{
-			Capella:   getHeaderResponse.Capella,
-			Timestamp: receivedAt,
 		}
 
 		getPayloadResponse, err := buildGetPayloadResponse(payload)
@@ -1245,41 +1288,19 @@ func (s *relay) submitNewBlockHandler(limiter *rateLimiter) http.HandlerFunc {
 			httpJSONError(w, http.StatusBadRequest, "failed to build get payload response")
 			return
 		}
-		versionedExecutedPayload := VersionedExecutedPayload{
-			Capella:   getPayloadResponse.Capella,
-			Timestamp: receivedAt,
-		}
 
-		bidTrace := BidTraceTimestamp{
-			BidTrace: BidTrace{
+		if err := s.store.PutBuilderBid(
+			BidTrace{
 				BidTrace:    *payloadBidTrace,
 				BlockNumber: payload.BlockNumber(),
 				NumTx:       uint64(payload.NumTx()),
 			},
-			Timestamp: receivedAt,
-		}
-
-		if err := s.store.PutBidTrace(bidTrace); err != nil {
-			log.Error(err, "failed to save delivered payload")
-			httpJSONError(w, http.StatusInternalServerError, "failed to save payload")
-			return
-		}
-
-		if err := s.store.PutExecutedPayload(payloadBidTrace.Slot, payloadBidTrace.ProposerPubkey, payloadBidTrace.BlockHash, versionedExecutedPayload); err != nil {
-			log.Error(err, "failed to save execution payload")
-			httpJSONError(w, http.StatusInternalServerError, "failed to save execution payload")
-			return
-		}
-
-		if err := s.store.PutLatestBuilderBid(payloadBidTrace.Slot, payloadBidTrace.ParentHash, payloadBidTrace.ProposerPubkey, payloadBidTrace.BuilderPubkey, builderBidHeaderResponse); err != nil {
-			log.Error(err, "failed to save latest builder bid")
-			httpJSONError(w, http.StatusInternalServerError, "failed to save latest builder bid")
-			return
-		}
-
-		if err := s.store.UpdateBestBid(payloadBidTrace.Slot, payloadBidTrace.ParentHash, payloadBidTrace.ProposerPubkey); err != nil {
-			log.Error(err, "failed to update best bid")
-			httpJSONError(w, http.StatusInternalServerError, "failed to update best bid")
+			*getPayloadResponse,
+			*getHeaderResponse,
+			receivedAt,
+		); err != nil {
+			log.Error(err, "failed to put submitted block")
+			httpJSONError(w, http.StatusInternalServerError, "failed to put submitted block")
 			return
 		}
 
@@ -1318,10 +1339,12 @@ func (s *relay) deliveredPayloadHandler() http.HandlerFunc {
 		_, span := s.tracer.Start(r.Context(), "proposerPayloadDelivered", trace.WithAttributes(attribute.String("query", r.URL.RawQuery)))
 		defer span.End()
 
-		log := logger.WithValues(
+		receivedAt := time.Now().UTC()
+		log := s.log.WithValues(
 			"method", "proposerPayloadDelivered",
 			"userAgent", r.UserAgent(),
 			"query", r.URL.RawQuery,
+			"receivedAt", receivedAt,
 		)
 
 		query := newProposerPayloadQuery()
@@ -1408,7 +1431,7 @@ func (s *relay) deliveredPayloadHandler() http.HandlerFunc {
 			return
 		}
 
-		delivered, err := s.store.DeliveredPayloads(query)
+		delivered, err := s.store.Delivered(query)
 		if err != nil {
 			log.Error(err, "failed to get payload delivered")
 			httpJSONError(w, http.StatusInternalServerError, "failed to get payload delivered")
@@ -1443,10 +1466,12 @@ func (s *relay) submissionPayloadHandler() http.HandlerFunc {
 		_, span := s.tracer.Start(r.Context(), "builderBlocksReceived", trace.WithAttributes(attribute.String("query", r.URL.RawQuery)))
 		defer span.End()
 
-		log := logger.WithValues(
+		receivedAt := time.Now().UTC()
+		log := s.log.WithValues(
 			"method", "builderBlocksReceived",
 			"userAgent", r.UserAgent(),
 			"query", r.URL.RawQuery,
+			"receivedAt", receivedAt,
 		)
 
 		query := newBuilderBlockQuery()
@@ -1501,7 +1526,7 @@ func (s *relay) submissionPayloadHandler() http.HandlerFunc {
 			return
 		}
 
-		submissions, err := s.store.BlockSubmissionsPayload(query)
+		submissions, err := s.store.Submitted(query)
 		if err != nil {
 			log.Error(err, "failed to get builder blocks")
 			httpJSONError(w, http.StatusInternalServerError, "failed to get builder blocks")
@@ -1527,10 +1552,12 @@ func (s *relay) registeredValidatorHandler() http.HandlerFunc {
 		_, span := s.tracer.Start(r.Context(), "getRegisteredValidator", trace.WithAttributes(attribute.String("query", r.URL.RawQuery)))
 		defer span.End()
 
-		log := logger.WithValues(
+		receivedAt := time.Now().UTC()
+		log := s.log.WithValues(
 			"method", "getRegisteredValidator",
 			"userAgent", r.UserAgent(),
 			"query", r.URL.RawQuery,
+			"receivedAt", receivedAt,
 		)
 
 		pubKeyStr := r.URL.Query().Get("pubkey")
@@ -1547,7 +1574,7 @@ func (s *relay) registeredValidatorHandler() http.HandlerFunc {
 			return
 		}
 
-		validator, err := s.store.RegisteredValidator(pubKey)
+		validator, err := s.store.Validator(pubKey)
 		if err != nil {
 			log.Error(err, "failed to get validator")
 			httpJSONError(w, http.StatusBadRequest, "failed to get validator")
@@ -1702,14 +1729,66 @@ type randaoHelper struct {
 }
 
 type randaoState struct {
-	expectedPrevRandao *randaoHelper
-	mux                sync.RWMutex
+	expectedRandao map[string]*randaoHelper
+	mux            sync.RWMutex
 }
 
 func newRandaoState() *randaoState {
 	return &randaoState{
-		expectedPrevRandao: &randaoHelper{},
+		expectedRandao: make(map[string]*randaoHelper),
 	}
+}
+
+func (r *randaoState) Put(parentHash string, randao *randaoHelper) {
+	r.mux.Lock()
+	defer r.mux.Unlock()
+	r.expectedRandao[parentHash] = randao
+}
+
+func (r *randaoState) ByHash(parentHash string) *randaoHelper {
+	r.mux.RLock()
+	defer r.mux.RUnlock()
+	randao, ok := r.expectedRandao[parentHash]
+	if !ok {
+		return nil
+	}
+	return randao
+}
+
+func (r *randaoState) Cleanup(slot uint64) {
+	r.mux.Lock()
+	defer r.mux.Unlock()
+	for k, v := range r.expectedRandao {
+		if v.slot < slot {
+			delete(r.expectedRandao, k)
+		}
+	}
+}
+
+type latestDeliveredPayloadState struct {
+	mux       sync.RWMutex
+	slot      uint64
+	blockHash *types.Hash
+}
+
+func newLatestDeliveredPayloadState() *latestDeliveredPayloadState {
+	return &latestDeliveredPayloadState{
+		slot:      0,
+		blockHash: nil,
+	}
+}
+
+func (l *latestDeliveredPayloadState) Set(slot uint64, blockHash types.Hash) {
+	l.mux.Lock()
+	defer l.mux.Unlock()
+	l.slot = slot
+	l.blockHash = &blockHash
+}
+
+func (l *latestDeliveredPayloadState) Get() (uint64, *types.Hash) {
+	l.mux.RLock()
+	defer l.mux.RUnlock()
+	return l.slot, l.blockHash
 }
 
 type withdrawalsHelper struct {
@@ -1718,13 +1797,39 @@ type withdrawalsHelper struct {
 }
 
 type withdrawalsState struct {
-	expectedRoot *withdrawalsHelper
+	expectedRoot map[string]*withdrawalsHelper
 	mux          sync.RWMutex
 }
 
 func newWithdrawalsState() *withdrawalsState {
 	return &withdrawalsState{
-		expectedRoot: &withdrawalsHelper{},
+		expectedRoot: make(map[string]*withdrawalsHelper),
+	}
+}
+
+func (w *withdrawalsState) Put(parentHash string, withdrawals *withdrawalsHelper) {
+	w.mux.Lock()
+	defer w.mux.Unlock()
+	w.expectedRoot[parentHash] = withdrawals
+}
+
+func (w *withdrawalsState) ByHash(parentHash string) *withdrawalsHelper {
+	w.mux.RLock()
+	defer w.mux.RUnlock()
+	withdrawals, ok := w.expectedRoot[parentHash]
+	if !ok {
+		return nil
+	}
+	return withdrawals
+}
+
+func (w *withdrawalsState) Cleanup(slot uint64) {
+	w.mux.Lock()
+	defer w.mux.Unlock()
+	for k, v := range w.expectedRoot {
+		if v.slot < slot {
+			delete(w.expectedRoot, k)
+		}
 	}
 }
 

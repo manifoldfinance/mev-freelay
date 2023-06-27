@@ -22,13 +22,12 @@ import (
 	"time"
 
 	"github.com/flashbots/go-boost-utils/types"
-	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/trace"
 )
 
 func TestInternalV1BuilderBaseHandler(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 	var (
 		a          = newTestAPI(t)
 		builderKey = types.PublicKey{0x12}
@@ -42,15 +41,18 @@ func TestInternalV1BuilderBaseHandler(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, pth, io.NopCloser(bytes.NewReader(body)))
-	h := httprouter.New()
-	h.HandlerFunc(http.MethodPost, "/internal/v1/builder/:pubkey", a.internalBuilderHandler())
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		vars := make(map[string]string)
+		vars["pubkey"] = builderKey.String()
+		a.internalBuilderHandler(w, r, vars)
+	})
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 	var bbs2 blockBuilderStatus
 	err := json.NewDecoder(rr.Body).Decode(&bbs2)
 	require.NoError(t, err)
 	require.Equal(t, "blacklisted", bbs2.NewStatus)
-	gbb, err := a.store.BlockBuilder(builderKey)
+	gbb, err := a.store.Builder(builderKey)
 	require.NoError(t, err)
 	require.False(t, gbb.HighPriority)
 	require.True(t, gbb.Blacklisted)
@@ -59,17 +61,16 @@ func TestInternalV1BuilderBaseHandler(t *testing.T) {
 func newTestAPI(t *testing.T) *api {
 	var (
 		known         = NewKnownValidators()
-		active        = NewActiveValidators()
 		genesisTime   = uint64(time.Now().Unix())
-		dbPrefix      = ""
 		network       = "goerli"
-		store, prefix = newTestStore(t)
+		store, prefix = newTestPebbleDB(t)
+		publicKey     = types.PublicKey{0x12}
 	)
 
 	t.Cleanup(func() {
 		store.Close()
-		testStoreDelete(t, prefix)
+		cleanupTestPebbleDB(t, prefix)
 	})
 
-	return NewAPI(store, known, active, genesisTime, network, dbPrefix, prefix, trace.NewNoopTracerProvider().Tracer("webApi"))
+	return NewAPI(store, known, genesisTime, network, publicKey, trace.NewNoopTracerProvider().Tracer("webApi"))
 }

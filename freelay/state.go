@@ -16,7 +16,10 @@ import (
 
 	"github.com/flashbots/go-boost-utils/types"
 	"github.com/manifoldfinance/mev-freelay/logger"
+	"go.uber.org/atomic"
 )
+
+const dutyStateTTL = DurationPerEpoch + time.Duration(10)*time.Second
 
 type DutySetter interface {
 	Set(duties []BuilderGetValidatorsResponseEntry, slot uint64)
@@ -65,16 +68,15 @@ func (d *dutyState) Set(duties []BuilderGetValidatorsResponseEntry, slot uint64)
 	defer d.mux.Unlock()
 
 	now := time.Now().UTC()
-	r := 0
 
 	d.proposerDutiesSlot = slot
 
 	dutyMap := make(map[uint64]*ProposerDutyData)
 
 	// filter out old duties
-	r = 0
+	r := 0
 	for slot, duty := range d.proposerDutyMap {
-		if duty.Timestamp.Add(DurationPerEpoch * 2).After(now) {
+		if duty.Timestamp.Add(dutyStateTTL).After(now) {
 			dutyMap[slot] = duty
 			continue
 		}
@@ -113,8 +115,8 @@ func (d *dutyState) Slot() uint64 {
 }
 
 type KnownValidatorSetter interface {
-	Set(v map[types.PubkeyHex]struct{}, vByIndx map[uint64]types.PubkeyHex)
-	Put(pbHex types.PubkeyHex, index uint64)
+	Set(v map[types.PubkeyHex]uint64, vByIndx map[uint64]types.PubkeyHex, slot uint64)
+	Updated(bool)
 	KnownValidatorGetter
 }
 
@@ -122,38 +124,36 @@ type KnownValidatorGetter interface {
 	ByIndex(index uint64) (types.PubkeyHex, error)
 	IsKnown(pbHex types.PubkeyHex) bool
 	Count() uint64
+	LastSlot() uint64
+	IsUpdated() bool
 }
 
 type knownValidators struct {
 	mux                    sync.RWMutex
-	knownValidators        map[types.PubkeyHex]struct{}
+	knownValidators        map[types.PubkeyHex]uint64
 	knownValidatorsByIndex map[uint64]types.PubkeyHex
+	lastSlot               uint64
+	updated                atomic.Bool
 }
 
 func NewKnownValidators() *knownValidators {
 	return &knownValidators{
-		knownValidators:        make(map[types.PubkeyHex]struct{}),
+		knownValidators:        make(map[types.PubkeyHex]uint64),
 		knownValidatorsByIndex: make(map[uint64]types.PubkeyHex),
 	}
 }
 
-func (vs *knownValidators) Set(v map[types.PubkeyHex]struct{}, vByIndx map[uint64]types.PubkeyHex) {
+func (vs *knownValidators) Set(v map[types.PubkeyHex]uint64, vByIndx map[uint64]types.PubkeyHex, slot uint64) {
 	vs.mux.Lock()
 	defer vs.mux.Unlock()
 	vs.knownValidators = v
 	vs.knownValidatorsByIndex = vByIndx
-}
-
-func (vs *knownValidators) Put(pbHex types.PubkeyHex, index uint64) {
-	vs.mux.Lock()
-	defer vs.mux.Unlock()
-	vs.knownValidators[pbHex] = struct{}{}
-	vs.knownValidatorsByIndex[index] = pbHex
+	vs.lastSlot = slot
 }
 
 func (vs *knownValidators) ByIndex(index uint64) (types.PubkeyHex, error) {
-	vs.mux.Lock()
-	defer vs.mux.Unlock()
+	vs.mux.RLock()
+	defer vs.mux.RUnlock()
 	v, ok := vs.knownValidatorsByIndex[index]
 	if !ok {
 		return "", ErrUnknownValidatorByIndx
@@ -176,65 +176,16 @@ func (vs *knownValidators) Count() uint64 {
 	return count
 }
 
-type ActiveValidatorSetter interface {
-	Put(pbHex types.PublicKey)
-	ClearOld()
-	Set([]types.PublicKey)
-	ActiveValidatorGetter
+func (vs *knownValidators) LastSlot() uint64 {
+	vs.mux.RLock()
+	defer vs.mux.RUnlock()
+	return vs.lastSlot
 }
 
-type ActiveValidatorGetter interface {
-	Get() []types.PublicKey
+func (vs *knownValidators) Updated(state bool) {
+	vs.updated.Store(state)
 }
 
-type activeValidators struct {
-	mux        sync.RWMutex
-	validators map[types.PublicKey]time.Time
-}
-
-func NewActiveValidators() *activeValidators {
-	return &activeValidators{
-		validators: make(map[types.PublicKey]time.Time),
-	}
-}
-
-func (v *activeValidators) Set(pubkey []types.PublicKey) {
-	v.mux.Lock()
-	defer v.mux.Unlock()
-	a := make(map[types.PublicKey]time.Time)
-	for _, v := range pubkey {
-		a[v] = time.Now().UTC()
-	}
-	v.validators = a
-}
-
-func (v *activeValidators) Put(pubkey types.PublicKey) {
-	v.mux.Lock()
-	defer v.mux.Unlock()
-	v.validators[pubkey] = time.Now().UTC()
-}
-
-func (v *activeValidators) ClearOld() {
-	v.mux.Lock()
-	defer v.mux.Unlock()
-
-	now := time.Now().UTC()
-	a := make(map[types.PublicKey]time.Time)
-	for k, v := range v.validators {
-		if v.Add(activeValidatorTimespan).After(now) {
-			a[k] = v
-		}
-	}
-
-	v.validators = a
-}
-
-func (v *activeValidators) Get() []types.PublicKey {
-	v.mux.RLock()
-	defer v.mux.RUnlock()
-	keys := make([]types.PublicKey, 0, len(v.validators))
-	for k := range v.validators {
-		keys = append(keys, k)
-	}
-	return keys
+func (vs *knownValidators) IsUpdated() bool {
+	return vs.updated.Load()
 }

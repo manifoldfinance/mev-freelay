@@ -23,6 +23,7 @@ bin/
 go.work
 
 .envrc.local
+.vscode
 
 k6/node_modules
 node_modules
@@ -30,6 +31,10 @@ node_modules
 *-store
 *.db
 *.db.*
+*_db
+*_db*
+
 
 web/.serve
 tmp
+__debug*

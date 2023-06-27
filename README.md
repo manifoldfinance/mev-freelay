@@ -14,49 +14,40 @@ Please note that this relay has not been subjected to a security audit, and as s
 
 # USP (Unique Selling Points)
 
-- Use of a single process and embedded bbolt database for persistence, leading to lower latency and resource usage for operations
+- Use of a single process and embedded pebble database for persistence, leading to lower latency and resource usage for operations
 - Automatic archiving of submitted payloads to S3, which keeps the operation database length constant
 - Simple backup and restore process
 
 # Tech Stack
 
-We aimed for a straightforward technology stack that is easy to manage and deploy. For handling **API** requests, we are using [httprouter](https://github.com/julienschmidt/httprouter). We chose [bbolt](https://github.com/etcd-io/bbolt) as our database due to its fast read speeds and wrapped it with [bolted](https://github.com/draganm/bolted) for greater control over read and write operations. Finally, we used [kartusche](https://github.com/numtide/kartusche) to build the website, which utilizes [mustache](https://mustache.github.io/) templating.
-
-# Build
-
-```
-DOCKER_BUILDKIT=1
-export CGO_CFLAGS_ALLOW="-D__BLST_PORTABLE__"
-export CGO_CFLAGS="-D__BLST_PORTABLE__"
-```
+We aimed for a straightforward technology stack that is easy to manage and deploy. We chose [pebble](https://github.com/cockroachdb/pebble) as our database due to its fast read speeds and multi threaded writes. Finally, we used [go-lean](https://github.com/draganm/go-lean) to build the website, which utilizes [mustache](https://mustache.github.io/) templating.
 
 # Production
 
 ## Using Dockerfile
 
 ```
-DOCKER_BUILDKIT=1 docker build -t freelay .
-docker run freelay -e BEACONS <prysm_beacon_url> -e BLOCK_SIM_URL <geth_url> -e SECRET_KEY <generate with cmd/keys> -e NETWORK goerli -e DB_PREFIX prod -e DB_DIR dbs
+DOCKER_BUILDKIT=1 docker build -t mev-freelay .
+docker run mev-freelay freelay -e BEACONS <prysm_beacon_url> -e BLOCK_SIM_URL <geth_url> -e SECRET_KEY <generate with keys> -e NETWORK goerli -e DB_PTH dbs/prod_db
 ```
 
 ## Using binary
 
 ```
-go build -o freelay cmd/freelay/main.go
-./freelay --beacons <prysm_beacon_url> --block-sim-url <geth_url> --secret-key <generate with cmd/keys> --network goerli --db-prefix prod --db-dir dbs
+go build -o mev-freelay .
+./mev-freelay freelay --beacons <prysm_beacon_url> --block-sim-url <geth_url> --secret-key <generate with keys> --network goerli --db-pth dbs/prod_db
 ```
 
 # Development
 
 ```
-go run cmd/freelay/main.go --beacons <prysm_beacon_url> --block-sim-url <geth_url> --secret-key <generate with cmd/keys> --network goerli --db-prefix prod --db-dir dbs
+go run main.go freerelay --beacons <prysm_beacon_url> --block-sim-url <geth_url> --secret-key <generate with keys> --network goerli --db-pth dbs/prod_db
+```
 
 Relay (Proposer, Builder, Data): http://localhost:50051
-API (Website API): http://localhost:50052
-Website: http://localhost:50053
-SFTP: http://localhost:50054
+API (Website): http://localhost:50052
 Prometheus: http://localhost:9000
-```
+PPROF: http://localhost:6060
 
 ## Minio S3
 
@@ -101,7 +92,7 @@ make swag
 ## Generate Keys
 
 ```
-go run cmd/keys/main.go
+go run main.go keys
 ```
 
 ## Backup Database to S3
@@ -109,7 +100,7 @@ go run cmd/keys/main.go
 It is using default `AWS` credentials. You can override them with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 
 ```
-go run cmd/backup/main.go --backup-url http://localhost:50052/backup --bucket <bucket>
+go run main.go backup --backup-url http://localhost:50052/api/backup --bucket <bucket>
 ```
 
 ## Restore Database from S3
@@ -117,7 +108,7 @@ go run cmd/backup/main.go --backup-url http://localhost:50052/backup --bucket <b
 It is using default `AWS` credentials. You can override them with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 
 ```
-go run cmd/restore/main.go --db-dir <dir> --db-prefix <prefix> --bucket <bucket>
+go run main.go restore --db-pth <db_pth> --bucket <bucket>
 ```
 
 ## Purge Database
@@ -127,25 +118,19 @@ Archives payloads (executed-payloads, submitted, bid-traces) that are older then
 It is using default `AWS` credentials. You can override them with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 
 ```
-go run cmd/purge/main.go --archive-url http://localhost:50052/archive --prune-url http://localhost:50052/prune  --bucket <bucket>
+go run main.go purge --archive-url http://localhost:50052/api/archive --prune-url http://localhost:50052/api/prune --bucket <bucket>
 ```
 
-## Compact Database
+## Migrate Database (bbolt -> pebble)
 
 ```
-go run cmd/compact/main.go --db-dir <dir> --db-prefix <prefix>
+go run main.go migrate --bbolt-pth <bbolt_pth> --pebble-pth <pebble_pth>
 ```
 
-## Migrate Database
+## Import Database (postgres -> pebble)
 
 ```
-go run cmd/migrate/main.go --db-dir <dir> --db-prefix <prefix>
-```
-
-## Import Delivered Payloads
-
-```
-go run cmd/import/main.go --db-dir <dir> --db-prefix <prefix> --file <file> --sql-uri <sql-uri> --sql-table <dev_payload_delivered>
+go run main.go import --db-pth <db_pth> --sql-uri <sql_uri> --sql-table-prefix <dev>
 ```
 
 # Builder Specs

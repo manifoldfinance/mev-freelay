@@ -25,7 +25,7 @@ import (
 )
 
 func TestBeaconJoin(t *testing.T) {
-	b := newBeacon("http://localhost:8080")
+	b := newBeacon("http://localhost:8080", 20)
 
 	pth := b.join("foo")
 	require.Equal(t, "http://localhost:8080/foo", pth)
@@ -44,10 +44,10 @@ func TestBeaconValidators(t *testing.T) {
 		srv.Close()
 	})
 
-	beacon := newBeacon(srv.URL)
+	beacon := newBeacon(srv.URL, 20)
 	v, err := beacon.Validators(0)
 	require.NoError(t, err)
-	require.Equal(t, 1, len(v))
+	require.Equal(t, 1, len(v.Data))
 }
 
 func mockBeaconGenesisInfoHandler() (http.HandlerFunc, *GenesisResponse) {
@@ -126,13 +126,13 @@ func mockBeaconProposerDutiesHandler(slot uint64, args ...any) (http.HandlerFunc
 	}, &p
 }
 
-func mockBeaconValidatorsHandler(fn func(), args ...any) (http.HandlerFunc, *AllValidatorsResponse) {
+func mockBeaconValidatorsHandler(fn func(), args ...any) (http.HandlerFunc, *KnownValidatorsResponse) {
 	vpk := types.PublicKey(random48Bytes()).PubkeyHex().String()
 	if len(args) > 0 && args[0] != nil {
 		vpk = args[0].(string)
 	}
 
-	v := AllValidatorsResponse{
+	v := KnownValidatorsResponse{
 		Data: []ValidatorResponseEntry{
 			{
 				Index:   uint64(1),

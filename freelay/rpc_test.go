@@ -13,15 +13,19 @@ package freelay
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	buildercapella "github.com/attestantio/go-builder-client/api/capella"
 	apiv1 "github.com/attestantio/go-builder-client/api/v1"
+	consensusbellatrix "github.com/attestantio/go-eth2-client/spec/bellatrix"
 	consensuscapella "github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -42,16 +46,53 @@ func TestSimulateBlockSubmission(t *testing.T) {
 		payload = &BuilderBlockValidationRequest{
 			BuilderSubmitBlockRequest: BuilderSubmitBlockRequest{
 				Capella: &buildercapella.SubmitBlockRequest{
-					Signature:        phase0.BLSSignature(random96Bytes()),
-					Message:          &apiv1.BidTrace{},
-					ExecutionPayload: &consensuscapella.ExecutionPayload{},
+					Signature: phase0.BLSSignature(random96Bytes()),
+					Message: &apiv1.BidTrace{
+						Slot:                 1,
+						ParentHash:           phase0.Hash32(random32Bytes()),
+						BlockHash:            phase0.Hash32(random32Bytes()),
+						BuilderPubkey:        phase0.BLSPubKey(random48Bytes()),
+						ProposerPubkey:       phase0.BLSPubKey(random48Bytes()),
+						ProposerFeeRecipient: consensusbellatrix.ExecutionAddress(random20Bytes()),
+						Value:                uint256.NewInt(2983),
+						GasLimit:             15_000_000,
+						GasUsed:              879,
+					},
+					ExecutionPayload: &consensuscapella.ExecutionPayload{
+						ParentHash:   phase0.Hash32(random32Bytes()),
+						FeeRecipient: consensusbellatrix.ExecutionAddress(random20Bytes()),
+						BlockHash:    phase0.Hash32(random32Bytes()),
+						ExtraData:    []byte{},
+						Timestamp:    1234567890,
+						Withdrawals: []*consensuscapella.Withdrawal{
+							{
+								ValidatorIndex: 0,
+								Index:          0,
+								Amount:         0,
+								Address:        consensusbellatrix.ExecutionAddress(random20Bytes()),
+							},
+						},
+						Transactions:  []consensusbellatrix.Transaction{[]byte{0x01, 0x02, 0x03}},
+						PrevRandao:    phase0.Hash32(random32Bytes()),
+						StateRoot:     random32Bytes(),
+						LogsBloom:     random256Bytes(),
+						BlockNumber:   123,
+						GasLimit:      15_000_000,
+						GasUsed:       879,
+						BaseFeePerGas: random32Bytes(),
+					},
 				},
 			},
+			RegisteredGasLimit: 15_000_000,
 		}
+		sim = NewBuilderBlockSimulator(time.Duration(10_000)*time.Millisecond, host.URL)
 	)
 	wg.Add(1)
 	defer host.Close()
-	err := simulateBlockSubmission(ctx, payload, host.URL)
+
+	pb, _ := json.Marshal(payload)
+	fmt.Println("simulating block submission", string(pb))
+	err := sim.SimulateBlockSubmission(ctx, payload)
 	wg.Wait()
 	require.NoError(t, err)
 	assert.Equal(t, "flashbots_validateBuilderSubmissionV2", b.Method)

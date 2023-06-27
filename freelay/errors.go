@@ -13,6 +13,8 @@ package freelay
 import "errors"
 
 var (
+	ErrNoData                               = errors.New("no data")
+	ErrInvalidKey                           = errors.New("invalid key")
 	ErrUnknownValidatorByIndx               = errors.New("unknown validator by index")
 	ErrInvalidForkVersion                   = errors.New("invalid fork version")
 	ErrPayloadNil                           = errors.New("payload is nil")
@@ -26,11 +28,9 @@ var (
 	ErrProposerLimit                        = errors.New("limit cannot be greater than 500")
 	ErrUnknownNetwork                       = errors.New("unknown network")
 	ErrNoArchivePayloadsFound               = errors.New("no payloads found")
-	ErrUpdateBestBid                        = errors.New("failed to update max profit bid because no bids were found")
 	ErrBestBidNotFound                      = errors.New("best bid not found")
 	ErrBidTraceExpired                      = errors.New("bid trace expired")
 	ErrBestBidExpired                       = errors.New("best bid expired")
-	ErrLatestBuilderBidExpired              = errors.New("latest builder bid expired")
 	ErrAllBeaconsFailedGetForkSchedule      = errors.New("all beacons failed to get fork schedule")
 	ErrAllBeaconsFailedGetWithdrawals       = errors.New("all beacons failed to get withdrawals")
 	ErrAllBeaconsFailedGetValidators        = errors.New("all beacons failed to get validators")
@@ -41,4 +41,10 @@ var (
 	ErrMismatchPayloads                     = errors.New("mismatch payloads")
 	ErrMismatchHeaders                      = errors.New("mismatch headers")
 	ErrNoPayloads                           = errors.New("no payloads")
+	ErrValidatorChanRegsFull                = errors.New("validator channel registrations full")
+	ErrValidatorTimestampTooFarInTheFuture  = errors.New("validator timestamp too far in the future")
+	ErrValidatorTimestampTooFarInThePast    = errors.New("validator timestamp too far in the past")
+	ErrValidatorUnknown                     = errors.New("validator unknown")
+	ErrMissedBlock                          = errors.New("missed block")
+	ErrShutdownInProgress                   = errors.New("shutdown in progress")
 )

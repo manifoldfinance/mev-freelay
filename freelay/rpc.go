@@ -17,9 +17,31 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
+
+	"github.com/flashbots/go-boost-utils/types"
+	"github.com/manifoldfinance/mev-freelay/logger"
 )
 
-func simulateBlockSubmission(ctx context.Context, payload *BuilderBlockValidationRequest, host string) error {
+type BuilderBlockSimulator interface {
+	SimulateBlockSubmission(ctx context.Context, payload *BuilderBlockValidationRequest) error
+}
+
+type builderBlockSimulate struct {
+	client   *http.Client
+	addr     string
+	safeAddr string
+}
+
+func NewBuilderBlockSimulator(timeout time.Duration, addr string) *builderBlockSimulate {
+	return &builderBlockSimulate{
+		client:   &http.Client{Timeout: timeout},
+		addr:     addr,
+		safeAddr: hideCredentialsFromURL(addr),
+	}
+}
+
+func (b *builderBlockSimulate) SimulateBlockSubmission(ctx context.Context, payload *BuilderBlockValidationRequest) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("context error: %w", err)
 	}
@@ -36,7 +58,8 @@ func simulateBlockSubmission(ctx context.Context, payload *BuilderBlockValidatio
 		return ErrInvalidPayloadSimulate
 	}
 
-	resp, err := sendrpcHTTP(ctx, host, msg)
+	bidTrace := payload.Message()
+	resp, err := sendrpcHTTP(b.client, b.addr, msg, bidTrace.Slot, bidTrace.BlockHash)
 	if err != nil {
 		return fmt.Errorf("could not send rpc: %w", err)
 	}
@@ -47,13 +70,13 @@ func simulateBlockSubmission(ctx context.Context, payload *BuilderBlockValidatio
 	return nil
 }
 
-func sendrpcHTTP(ctx context.Context, host string, msgs jsonrpcMessage) (*jsonrpcMessage, error) {
+func sendrpcHTTP(client *http.Client, host string, msgs jsonrpcMessage, slot uint64, blockHash types.Hash) (*jsonrpcMessage, error) {
 	body, err := json.Marshal(msgs)
 	if err != nil {
 		return nil, fmt.Errorf("could not marshal messages: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host, io.NopCloser(bytes.NewReader(body)))
+	req, err := http.NewRequest(http.MethodPost, host, io.NopCloser(bytes.NewReader(body)))
 	if err != nil {
 		return nil, fmt.Errorf("could not create request: %w", err)
 	}
@@ -61,24 +84,32 @@ func sendrpcHTTP(ctx context.Context, host string, msgs jsonrpcMessage) (*jsonrp
 	req.ContentLength = int64(len(body))
 	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Add("X-Request-ID", fmt.Sprintf("%d/%s", slot, blockHash.String()))
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("could not send request: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
-	var respmsgs jsonrpcMessage
-	if err := json.NewDecoder(resp.Body).Decode(&respmsgs); err != nil {
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Error(err, "could not read response bytes", "body", resp.Body)
+		return nil, fmt.Errorf("could not read response bytes: %w", err)
+	}
+
+	respmsgs := new(jsonrpcMessage)
+	if err := json.NewDecoder(bytes.NewReader(raw)).Decode(respmsgs); err != nil {
+		logger.Error(err, "could not decode response", "body", string(raw))
 		return nil, fmt.Errorf("could not decode response: %w", err)
 	}
 
-	return &respmsgs, nil
+	return respmsgs, nil
 }
 
 type jsonrpcMessage struct {
-	Version string          `json:"jsonrpc,omitempty"`
-	ID      json.RawMessage `json:"id,omitempty"`
+	Version string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
 	Method  string          `json:"method,omitempty"`
 	Params  []interface{}   `json:"params,omitempty"`
 	Error   *jsonrpcError   `json:"error,omitempty"`

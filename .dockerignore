@@ -12,5 +12,8 @@ shell.nix
 README.md
 minio.yaml
 ingress.yaml
-Makefile
+swag.yaml
+swagger.yaml
 treefmt.toml
+\_db
+Makefile

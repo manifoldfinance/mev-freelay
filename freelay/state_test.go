@@ -74,7 +74,7 @@ func TestDutyState(t *testing.T) {
 				},
 			},
 		},
-		Timestamp: time.Now().UTC().Add(-(DurationPerEpoch * 2)),
+		Timestamp: time.Now().UTC().Add(-(dutyStateTTL)),
 	}
 	s.mux.Unlock()
 

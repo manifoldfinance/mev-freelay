@@ -21,17 +21,20 @@ import (
 	"time"
 
 	consensuscapella "github.com/attestantio/go-eth2-client/spec/capella"
-	"github.com/flashbots/go-boost-utils/types"
 	"github.com/manifoldfinance/mev-freelay/logger"
 	"github.com/r3labs/sse/v2"
 	"go.uber.org/atomic"
 	"gopkg.in/cenkalti/backoff.v1"
 )
 
+const (
+	syncTimeoutSec = 5
+)
+
 // Swagger Docs: https://ethereum.github.io/beacon-APIs/#/Beacon
 type MultiBeacon interface {
 	Genesis() (*GenesisInfo, error)
-	Validators(headSlot uint64) (map[types.PubkeyHex]ValidatorResponseEntry, error)
+	Validators(headSlot uint64) (*KnownValidatorsResponse, error)
 	BestSyncingNode() (*SyncNodeResponse, error)
 	ProposerDuties(epoch uint64) (*ProposerDutiesResponse, error)
 	SubscribeToHeadEvents(slot chan HeadEvent)
@@ -46,22 +49,27 @@ type MultiBeacon interface {
 type multiBeacon struct {
 	beacons         []beacon
 	bestBeaconIndex atomic.Int64
+	log             logger.Logger
 }
 
 type beacon struct {
-	uri     string
-	safeURI string
+	uri              string
+	safeURI          string
+	syncStatusClient *http.Client
+	validatorsClient *http.Client
+	log              logger.Logger
 }
 
-func NewMultiBeacon(beaconURIs []string) *multiBeacon {
+func NewMultiBeacon(beaconURIs []string, validatorsTimeout uint64) *multiBeacon {
 	beacons := make([]beacon, 0)
 	for _, uri := range beaconURIs {
-		beacons = append(beacons, *newBeacon(uri))
+		beacons = append(beacons, *newBeacon(uri, validatorsTimeout))
 	}
 
 	return &multiBeacon{
 		beacons:         beacons,
 		bestBeaconIndex: *atomic.NewInt64(0),
+		log:             logger.WithValues("module", "multiBeacon"),
 	}
 }
 
@@ -76,14 +84,27 @@ func (mb *multiBeacon) beaconsByLastResponse() []beacon {
 	return beacons
 }
 
-func (mb *multiBeacon) Validators(headSlot uint64) (map[types.PubkeyHex]ValidatorResponseEntry, error) {
-	beacons := mb.beaconsByLastResponse()
+func (mb *multiBeacon) beaconsByLeastUsed() []beacon {
+	last := mb.beaconsByLastResponse()
+	beacons := make([]beacon, len(last))
+
+	for i := 0; i < len(last); i++ {
+		beacons[i] = last[len(last)-i-1]
+	}
+
+	return beacons
+}
+
+func (mb *multiBeacon) Validators(headSlot uint64) (*KnownValidatorsResponse, error) {
+	beacons := mb.beaconsByLeastUsed()
 	for i, b := range beacons {
+		mb.log.Info("getting validators", "uri", b.safeURI, "headSlot", headSlot)
 		validators, err := b.Validators(headSlot)
 		if err != nil {
-			logger.Error(err, "error getting validators", "uri", b.safeURI, "headSlot", headSlot)
+			mb.log.Error(err, "error getting validators", "uri", b.safeURI, "headSlot", headSlot)
 			continue
 		}
+		mb.log.Info("got validators", "uri", b.safeURI, "headSlot", headSlot)
 		mb.bestBeaconIndex.Store(int64(i))
 		return validators, nil
 	}
@@ -96,11 +117,13 @@ func (mb *multiBeacon) Genesis() (*GenesisInfo, error) {
 		res *GenesisInfo
 	)
 	beacons := mb.beaconsByLastResponse()
-	for _, b := range beacons {
+	for i, b := range beacons {
 		res, err = b.Genesis()
 		if err != nil {
 			continue
 		}
+
+		mb.bestBeaconIndex.Store(int64(i))
 		return res, nil
 	}
 	return nil, err
@@ -108,23 +131,41 @@ func (mb *multiBeacon) Genesis() (*GenesisInfo, error) {
 
 func (mb *multiBeacon) BestSyncingNode() (*SyncNodeResponse, error) {
 	beacons := mb.beaconsByLastResponse()
+	var bestSync *SyncNodeResponse
 	for _, b := range beacons {
 		resp, err := b.SyncStatus()
 		if err != nil {
-			logger.Error(err, "error getting sync status", "uri", b.safeURI)
+			mb.log.Error(err, "error getting sync status", "uri", b.safeURI)
 			continue
 		}
 
 		if resp == nil {
-			logger.Info("empty response sync status", "uri", b.safeURI)
+			mb.log.Info("empty response sync status", "uri", b.safeURI)
 			continue
 		}
 
-		if !resp.Data.IsSyncing {
-			return resp, nil
+		if resp.Data.IsSyncing {
+			continue
+		}
+
+		if bestSync == nil {
+			bestSync = resp
+		}
+
+		if bestSync.Data.HeadSlot < resp.Data.HeadSlot {
+			bestSync = resp
+		}
+
+		if resp.Data.SyncDistance <= 6 {
+			break
 		}
 	}
-	return nil, ErrNoBeaconSynced
+
+	if bestSync == nil {
+		return nil, ErrNoBeaconSynced
+	}
+
+	return bestSync, nil
 }
 
 func (mb *multiBeacon) ProposerDuties(epoch uint64) (*ProposerDutiesResponse, error) {
@@ -132,7 +173,7 @@ func (mb *multiBeacon) ProposerDuties(epoch uint64) (*ProposerDutiesResponse, er
 	for i, beacon := range beacons {
 		duties, err := beacon.ProposerDuties(epoch)
 		if err != nil {
-			logger.Error(err, "error getting proposer duties", "uri", beacon.safeURI)
+			mb.log.Error(err, "error getting proposer duties", "uri", beacon.safeURI)
 			continue
 		}
 		mb.bestBeaconIndex.Store(int64(i))
@@ -155,12 +196,13 @@ func (mb *multiBeacon) SubscribeToPayloadAttributesEvents(payload chan PayloadAt
 
 func (mb *multiBeacon) Randao(slot uint64) (*RandaoResponse, error) {
 	beacons := mb.beaconsByLastResponse()
-	for _, beacon := range beacons {
+	for i, beacon := range beacons {
 		randao, err := beacon.Randao(slot)
 		if err != nil {
-			logger.Error(err, "error getting randao", "uri", beacon.safeURI, "slot", slot)
+			mb.log.Error(err, "error getting randao", "uri", beacon.safeURI, "slot", slot)
 			continue
 		}
+		mb.bestBeaconIndex.Store(int64(i))
 		return randao, nil
 	}
 	return nil, ErrAllBeaconsFailedGetRandao
@@ -171,10 +213,10 @@ func (mb *multiBeacon) PublishBlock(block *SignedBeaconBlock) error {
 	results := make(chan error, len(beacons))
 	for _, b := range beacons {
 		go func(_b beacon) {
-			logger.Info("publishing block", "uri", _b.safeURI, "block", block)
+			mb.log.Info("publishing block", "uri", _b.safeURI, "block", block)
 			err := _b.PublishBlock(block)
 			if err != nil {
-				logger.Error(err, "error publishing block", "uri", _b.safeURI)
+				mb.log.Error(err, "error publishing block", "uri", _b.safeURI)
 			}
 			results <- err
 		}(b)
@@ -182,23 +224,25 @@ func (mb *multiBeacon) PublishBlock(block *SignedBeaconBlock) error {
 
 	for i := 0; i < len(beacons); i++ {
 		if err := <-results; err == nil {
-			logger.Info("block published", "block", block)
+			mb.bestBeaconIndex.Store(int64(i))
+			mb.log.Info("block published", "block", block)
 			return nil
 		}
 	}
 
-	logger.Info("all beacons failed to publish block", "block", block)
+	mb.log.Info("all beacons failed to publish block", "block", block)
 	return ErrAllBeaconsFailedPublishBlock
 }
 
 func (mb *multiBeacon) BlockBySlot(slot uint64) (*BeaconBlockResponse, error) {
 	beacons := mb.beaconsByLastResponse()
-	for _, beacon := range beacons {
+	for i, beacon := range beacons {
 		block, err := beacon.BlockBySlot(slot)
 		if err != nil {
-			logger.Error(err, "error getting block by slot", "uri", beacon.safeURI, "slot", slot)
+			mb.log.Error(err, "error getting block by slot", "uri", beacon.safeURI, "slot", slot)
 			continue
 		}
+		mb.bestBeaconIndex.Store(int64(i))
 		return block, nil
 	}
 	return nil, ErrAllBeaconsFailedGetBlockBySlot
@@ -206,12 +250,13 @@ func (mb *multiBeacon) BlockBySlot(slot uint64) (*BeaconBlockResponse, error) {
 
 func (mb *multiBeacon) ForkSchedule() (*ForkScheduleResponse, error) {
 	beacons := mb.beaconsByLastResponse()
-	for _, beacon := range beacons {
+	for i, beacon := range beacons {
 		fork, err := beacon.ForkSchedule()
 		if err != nil {
-			logger.Error(err, "error getting fork schedule", "uri", beacon.safeURI)
+			mb.log.Error(err, "error getting fork schedule", "uri", beacon.safeURI)
 			continue
 		}
+		mb.bestBeaconIndex.Store(int64(i))
 		return fork, nil
 	}
 	return nil, ErrAllBeaconsFailedGetForkSchedule
@@ -219,34 +264,45 @@ func (mb *multiBeacon) ForkSchedule() (*ForkScheduleResponse, error) {
 
 func (mb *multiBeacon) Withdrawals(slot uint64) (*WithdrawalsResponse, error) {
 	beacons := mb.beaconsByLastResponse()
-	for _, beacon := range beacons {
+	for i, beacon := range beacons {
 		withdrawals, err := beacon.Withdrawals(slot)
 		if err != nil {
-			logger.Error(err, "error getting withdrawals", "uri", beacon.safeURI, "slot", slot)
+			mb.log.Error(err, "error getting withdrawals", "uri", beacon.safeURI, "slot", slot)
 			if strings.Contains(err.Error(), "Withdrawals not enabled before capella") {
 				break
 			}
 			continue
 		}
+		mb.bestBeaconIndex.Store(int64(i))
 		return withdrawals, nil
 	}
 	return nil, ErrAllBeaconsFailedGetWithdrawals
 }
 
-func newBeacon(uri string) *beacon {
-	return &beacon{uri: uri, safeURI: hideCredentialsFromURL(uri)}
+func newBeacon(uri string, validatorsTimeout uint64) *beacon {
+	return &beacon{
+		uri:     uri,
+		safeURI: hideCredentialsFromURL(uri),
+		syncStatusClient: &http.Client{
+			Timeout: time.Duration(syncTimeoutSec) * time.Second,
+		},
+		validatorsClient: &http.Client{
+			Timeout: time.Duration(validatorsTimeout) * time.Second,
+		},
+		log: logger.WithValues("module", "beacon"),
+	}
 }
 
 func (b *beacon) join(pth string) string {
 	uri, err := url.JoinPath(b.uri, pth)
 	if err != nil {
-		logger.Error(err, "error joining path", "uri", b.safeURI, "path", pth)
+		b.log.Error(err, "error joining path", "uri", b.safeURI, "path", pth)
 		return fmt.Sprintf("%s%s", b.uri, pth)
 	}
 
 	un, err := url.PathUnescape(uri)
 	if err != nil {
-		logger.Error(err, "error unescaping path", "uri", b.safeURI, "path", pth)
+		b.log.Error(err, "error unescaping path", "uri", b.safeURI, "path", pth)
 		return fmt.Sprintf("%s%s", b.uri, pth)
 	}
 	return un
@@ -254,34 +310,29 @@ func (b *beacon) join(pth string) string {
 
 func (b *beacon) Genesis() (*GenesisInfo, error) {
 	resp := new(GenesisResponse)
-	_, err := sendHTTP(b.join("/eth/v1/beacon/genesis"), http.MethodGet, nil, &resp)
+	_, err := sendHTTP(http.DefaultClient, b.join("/eth/v1/beacon/genesis"), http.MethodGet, nil, &resp)
 	return &resp.Data, err
 }
 
-func (b *beacon) Validators(headSlot uint64) (map[types.PubkeyHex]ValidatorResponseEntry, error) {
-	resp := new(AllValidatorsResponse)
-	_, err := sendHTTP(b.join(fmt.Sprintf("/eth/v1/beacon/states/%d/validators?status=active,pending", headSlot)), http.MethodGet, nil, &resp)
+func (b *beacon) Validators(headSlot uint64) (*KnownValidatorsResponse, error) {
+	resp := new(KnownValidatorsResponse)
+	_, err := sendHTTP(b.validatorsClient, b.join(fmt.Sprintf("/eth/v1/beacon/states/%d/validators?status=active,pending", headSlot)), http.MethodGet, nil, &resp)
 	if err != nil {
 		return nil, err
 	}
 
-	validators := make(map[types.PubkeyHex]ValidatorResponseEntry)
-	for _, v := range resp.Data {
-		validators[types.PubkeyHex(v.Validator.Pubkey)] = v
-	}
-
-	return validators, err
+	return resp, err
 }
 
 func (b *beacon) SyncStatus() (*SyncNodeResponse, error) {
 	resp := new(SyncNodeResponse)
-	_, err := sendHTTP(b.join("/eth/v1/node/syncing"), http.MethodGet, nil, &resp)
+	_, err := sendHTTP(b.syncStatusClient, b.join("/eth/v1/node/syncing"), http.MethodGet, nil, &resp)
 	return resp, err
 }
 
 func (b *beacon) ProposerDuties(epoch uint64) (*ProposerDutiesResponse, error) {
 	resp := new(ProposerDutiesResponse)
-	_, err := sendHTTP(b.join(fmt.Sprintf("/eth/v1/validator/duties/proposer/%d", epoch)), http.MethodGet, nil, &resp)
+	_, err := sendHTTP(http.DefaultClient, b.join(fmt.Sprintf("/eth/v1/validator/duties/proposer/%d", epoch)), http.MethodGet, nil, &resp)
 	return resp, err
 }
 
@@ -299,19 +350,19 @@ func (b *beacon) SubscribeToHeadEvents(slot chan HeadEvent) {
 	}
 
 	client.ReconnectNotify = func(err error, d time.Duration) {
-		logger.Error(err, "reconnecting to head events SSE", "backoff", d.Seconds(), "uri", b.safeURI)
+		b.log.Error(err, "reconnecting to head events SSE", "backoff", d.Seconds(), "uri", b.safeURI)
 	}
 
 	if err := client.SubscribeRaw(func(msg *sse.Event) {
 		var h HeadEvent
 		if err := json.Unmarshal(msg.Data, &h); err != nil {
-			logger.Error(err, "error unmarshalling head event")
+			b.log.Error(err, "error unmarshalling head event")
 			return
 		}
-		logger.Info("new beacon slot event", "slot", h.Slot)
+		b.log.Info("new beacon slot event", "slot", h.Slot)
 		slot <- h
 	}); err != nil {
-		logger.Error(err, "error subscribing to head events")
+		b.log.Error(err, "error subscribing to head events")
 	}
 }
 
@@ -329,30 +380,30 @@ func (b *beacon) SubscribeToPayloadAttributesEvents(payload chan PayloadAttribut
 	}
 
 	client.ReconnectNotify = func(err error, d time.Duration) {
-		logger.Error(err, "reconnecting payloads attributes events SSE", "backoff", d.Seconds(), "uri", b.safeURI)
+		b.log.Error(err, "reconnecting payloads attributes events SSE", "backoff", d.Seconds(), "uri", b.safeURI)
 	}
 
 	if err := client.SubscribeRaw(func(msg *sse.Event) {
 		var p PayloadAttributesEvent
 		if err := json.Unmarshal(msg.Data, &p); err != nil {
-			logger.Error(err, "error unmarshalling payload attributes event")
+			b.log.Error(err, "error unmarshalling payload attributes event")
 			return
 		}
-		logger.Info("new payload attributes event", "proposalSlot", p.Data.ProposalSlot)
+		b.log.Info("new payload attributes event", "proposalSlot", p.Data.ProposalSlot)
 		payload <- p
 	}); err != nil {
-		logger.Error(err, "error subscribing to payload attributes events")
+		b.log.Error(err, "error subscribing to payload attributes events")
 	}
 }
 
 func (b *beacon) Randao(slot uint64) (*RandaoResponse, error) {
 	resp := new(RandaoResponse)
-	_, err := sendHTTP(b.join(fmt.Sprintf("/eth/v1/beacon/states/%d/randao", slot)), http.MethodGet, nil, &resp)
+	_, err := sendHTTP(http.DefaultClient, b.join(fmt.Sprintf("/eth/v1/beacon/states/%d/randao", slot)), http.MethodGet, nil, &resp)
 	return resp, err
 }
 
 func (b *beacon) PublishBlock(block *SignedBeaconBlock) error {
-	code, err := sendHTTP(b.join("/eth/v1/beacon/blocks"), http.MethodPost, block, nil)
+	code, err := sendHTTP(http.DefaultClient, b.join("/eth/v1/beacon/blocks"), http.MethodPost, block, nil)
 	if err != nil {
 		return err
 	}
@@ -366,24 +417,26 @@ func (b *beacon) PublishBlock(block *SignedBeaconBlock) error {
 
 func (b *beacon) BlockBySlot(slot uint64) (*BeaconBlockResponse, error) {
 	resp := new(BeaconBlockResponse)
-	_, err := sendHTTP(b.join(fmt.Sprintf("/eth/v2/beacon/blocks/%d", slot)), http.MethodGet, nil, &resp)
+	_, err := sendHTTP(http.DefaultClient, b.join(fmt.Sprintf("/eth/v2/beacon/blocks/%d", slot)), http.MethodGet, nil, &resp)
 	return resp, err
 }
 
 func (b *beacon) ForkSchedule() (*ForkScheduleResponse, error) {
 	resp := new(ForkScheduleResponse)
-	_, err := sendHTTP(b.join("/eth/v1/config/fork_schedule"), http.MethodGet, nil, &resp)
+	_, err := sendHTTP(http.DefaultClient, b.join("/eth/v1/config/fork_schedule"), http.MethodGet, nil, &resp)
 	return resp, err
 }
 
 func (b *beacon) Withdrawals(slot uint64) (*WithdrawalsResponse, error) {
 	resp := new(WithdrawalsResponse)
-	_, err := sendHTTP(b.join(fmt.Sprintf("/eth/v1/beacon/states/%d/withdrawals", slot)), http.MethodGet, nil, &resp)
+	_, err := sendHTTP(http.DefaultClient, b.join(fmt.Sprintf("/eth/v1/beacon/states/%d/withdrawals", slot)), http.MethodGet, nil, &resp)
 	return resp, err
 }
 
-type AllValidatorsResponse struct {
-	Data []ValidatorResponseEntry `json:"data"`
+type KnownValidatorsResponse struct {
+	Data                []ValidatorResponseEntry `json:"data"`
+	ExecutionOptimistic bool                     `json:"execution_optimistic"`
+	Finalized           bool                     `json:"finalized"`
 }
 
 type ValidatorResponseEntry struct {
@@ -486,20 +539,32 @@ type BeaconBlockResponse struct {
 	Version string            `json:"version"`
 }
 
-func sendHTTP(uri string, method string, msg, dst any) (int, error) {
-	payload, err := json.Marshal(msg)
-	if err != nil {
-		return 0, err
+func sendHTTP(client *http.Client, uri string, method string, msg, dst any) (int, error) {
+	var req *http.Request
+	if msg != nil {
+		payload, err := json.Marshal(msg)
+		if err != nil {
+			return 0, err
+		}
+
+		req, err = http.NewRequest(method, uri, io.NopCloser(bytes.NewReader(payload)))
+		if err != nil {
+			return 0, err
+		}
+		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(payload)), nil }
+		req.Header.Add("Content-Type", "application/json")
+	} else {
+		var err error
+		req, err = http.NewRequest(method, uri, nil)
+		if err != nil {
+			return 0, err
+		}
+		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("")), nil }
 	}
 
-	req, err := http.NewRequest(method, uri, io.NopCloser(bytes.NewReader(payload)))
-	if err != nil {
-		return 0, err
-	}
+	req.Header.Set("Accept", "application/json")
 
-	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(payload)), nil }
-
-	res, err := http.DefaultClient.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -507,7 +572,7 @@ func sendHTTP(uri string, method string, msg, dst any) (int, error) {
 
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return 0, err
+		return res.StatusCode, err
 	}
 
 	if res.StatusCode >= http.StatusMultipleChoices {

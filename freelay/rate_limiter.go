@@ -16,6 +16,26 @@ import (
 	"time"
 )
 
+type RateLimiter interface {
+	Wait(ctx context.Context, key string) error
+	Close(key string)
+}
+
+func NewRateLimiter(max uint64, d time.Duration) RateLimiter {
+	if max == 0 {
+		return &noRateLimiter{}
+	}
+	return newRateLimiter(max, d)
+}
+
+type noRateLimiter struct{}
+
+func (i *noRateLimiter) Wait(ctx context.Context, key string) error {
+	return nil
+}
+
+func (i *noRateLimiter) Close(key string) {}
+
 type rateLimiter struct {
 	keys map[string]*rateLimiterTimestamp
 	max  uint64
