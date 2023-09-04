@@ -35,16 +35,17 @@ import (
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	utilbellatrix "github.com/attestantio/go-eth2-client/util/bellatrix"
 	utilcapella "github.com/attestantio/go-eth2-client/util/capella"
-	"github.com/draganm/bolted"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/types"
+	"github.com/gorilla/mux"
 	"github.com/holiman/uint256"
-	"github.com/julienschmidt/httprouter"
+	"github.com/manifoldfinance/mev-freelay/logger"
 	"github.com/prysmaticlabs/go-bitfield"
 	"github.com/r3labs/sse/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/atomic"
 )
 
 func TestRootHandler(t *testing.T) {
@@ -56,11 +57,11 @@ func TestRootHandler(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rr.Code)
 	res, _ := io.ReadAll(rr.Body)
-	assert.Equal(t, "PBS Relay API", string(res))
+	assert.Equal(t, "MEV Freelay API", string(res))
 }
 
-func TestBuilderStatusHandler(t *testing.T) {
-	s := newTestRelay(t, 0, nil)
+func TestStatusHandler(t *testing.T) {
+	s := newTestRelay(t, 96, nil)
 	rr := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/eth/v1/builder/status", nil)
 	h := http.HandlerFunc(s.statusHandler())
@@ -71,7 +72,7 @@ func TestBuilderStatusHandler(t *testing.T) {
 	assert.Equal(t, []byte{}, b)
 }
 
-func TestBuilderValidatorHandler(t *testing.T) {
+func TestRegisterValidatorHandler(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 
@@ -82,9 +83,9 @@ func TestBuilderValidatorHandler(t *testing.T) {
 			wg.Done()
 		}, pk.PubkeyHex().String())
 		mockHandlers = map[string]http.HandlerFunc{
-			"/eth/v1/beacon/states/0/validators": mvh,
+			"/eth/v1/beacon/states/96/validators": mvh,
 		}
-		s   = newTestRelay(t, 0, mockHandlers)
+		s   = newTestRelay(t, 96, mockHandlers)
 		msg = &types.RegisterValidatorRequestMessage{
 			FeeRecipient: types.Address(random20Bytes()),
 			GasLimit:     15_000_000,
@@ -112,7 +113,9 @@ func TestBuilderValidatorHandler(t *testing.T) {
 	assert.Equal(t, []byte{}, b)
 	assert.Equal(t, "", rr.Body.String())
 
-	v, err := s.store.AllRegisteredValidators()
+	time.Sleep(200 * time.Millisecond) // because storing data into db takes some time after the handler is called
+
+	v, err := s.store.Validators()
 	require.NoError(t, err)
 	require.Equal(t, 1, len(v))
 	require.Equal(t, m, v[0])
@@ -120,47 +123,97 @@ func TestBuilderValidatorHandler(t *testing.T) {
 
 func TestBuilderHeaderHandlerCapella(t *testing.T) {
 	var (
-		s          = newTestRelay(t, 0, map[string]http.HandlerFunc{})
-		slot       = uint64(0)
+		slot       = uint64(96)
+		s          = newTestRelay(t, slot, map[string]http.HandlerFunc{})
 		parentHash = types.Hash(random32Bytes())
 		pubKey     = types.PublicKey(random48Bytes())
-		builderKey = types.PublicKey(random48Bytes())
 		pth        = fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", slot, parentHash.String(), pubKey.String())
-		builderBid = BuilderBidHeaderResponse{
-			Timestamp: time.Now().UTC(),
-			Capella: &builderspec.VersionedSignedBuilderBid{
-				Version: consensusspec.DataVersionCapella,
-				Capella: &buildercapella.SignedBuilderBid{
-					Message: &buildercapella.BuilderBid{
-						Value: uint256.NewInt(123),
-						Header: &consensuscapella.ExecutionPayloadHeader{
-							BlockHash: phase0.Hash32(random32Bytes()),
-							ExtraData: []byte{0x01, 0x02, 0x03},
-						},
+		bidTrace   = BidTrace{
+			BidTrace: types.BidTrace{
+				Slot:           slot,
+				BlockHash:      types.Hash(random32Bytes()),
+				ParentHash:     parentHash,
+				ProposerPubkey: pubKey,
+			},
+			BlockNumber: 1,
+		}
+		executed = &builderapi.VersionedExecutionPayload{
+			Version: consensusspec.DataVersionCapella,
+			Capella: &consensuscapella.ExecutionPayload{
+				ParentHash:   phase0.Hash32(random32Bytes()),
+				FeeRecipient: consensusbellatrix.ExecutionAddress(random20Bytes()),
+				StateRoot:    random32Bytes(),
+				ReceiptsRoot: random32Bytes(),
+				LogsBloom:    random256Bytes(),
+				PrevRandao:   random32Bytes(),
+				BlockNumber:  1000,
+				GasLimit:     50,
+				GasUsed:      10,
+				Timestamp:    100,
+				ExtraData:    []byte{0x1, 0x2, 0x3, 0x4, 0x5},
+				BlockHash:    phase0.Hash32(random32Bytes()),
+				Transactions: []consensusbellatrix.Transaction{},
+				Withdrawals:  []*consensuscapella.Withdrawal{},
+			},
+		}
+		builderBid = &builderspec.VersionedSignedBuilderBid{
+			Version: consensusspec.DataVersionCapella,
+			Capella: &buildercapella.SignedBuilderBid{
+				Message: &buildercapella.BuilderBid{
+					Value:  uint256.NewInt(101),
+					Pubkey: phase0.BLSPubKey(random48Bytes()),
+					Header: &consensuscapella.ExecutionPayloadHeader{
+						ParentHash:       phase0.Hash32(bidTrace.ParentHash),
+						FeeRecipient:     consensusbellatrix.ExecutionAddress(random20Bytes()),
+						StateRoot:        random32Bytes(),
+						ReceiptsRoot:     random32Bytes(),
+						LogsBloom:        random256Bytes(),
+						PrevRandao:       random32Bytes(),
+						BlockNumber:      1000,
+						GasLimit:         50,
+						GasUsed:          10,
+						Timestamp:        100,
+						ExtraData:        []byte{0x1, 0x2, 0x3, 0x4, 0x5},
+						BaseFeePerGas:    random32Bytes(),
+						BlockHash:        phase0.Hash32(random32Bytes()),
+						TransactionsRoot: phase0.Root(random32Bytes()),
+						WithdrawalsRoot:  phase0.Root(random32Bytes()),
 					},
 				},
+				Signature: phase0.BLSSignature(random96Bytes()),
 			},
+		}
+		builderBidHeaderResponse = BuilderBidHeaderResponse{
+			Timestamp: time.Now().UTC(),
+			Capella:   builderBid,
 		}
 	)
 
-	err := s.store.PutLatestBuilderBid(slot, parentHash, pubKey, builderKey, builderBid)
-	require.NoError(t, err)
-	err = s.store.UpdateBestBid(slot, parentHash, pubKey)
+	err := s.store.PutBuilderBid(
+		bidTrace,
+		GetPayloadResponse{
+			Capella: executed,
+		},
+		GetHeaderResponse{
+			Capella: builderBid,
+		},
+		time.Now().UTC(),
+	)
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, pth, nil)
-	h := httprouter.New()
-	h.HandlerFunc(http.MethodGet, "/eth/v1/builder/header/:slot/:parentHash/:pubKey", s.builderHeaderHandler())
+	h := mux.NewRouter()
+	h.HandleFunc("/eth/v1/builder/header/{slot:[0-9]+}/{parentHash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}", s.builderHeaderHandler()).Methods(http.MethodGet)
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
-	bb, err := json.Marshal(builderBid.Capella)
+	bb, err := json.Marshal(builderBidHeaderResponse.Capella)
 	require.NoError(t, err)
 	require.Equal(t, string(bb)+"\n", rr.Body.String())
 	var res builderspec.VersionedSignedBuilderBid
 	err = json.NewDecoder(rr.Body).Decode(&res)
 	require.NoError(t, err)
-	require.Equal(t, builderBid.Capella, &res)
+	require.Equal(t, builderBidHeaderResponse.Capella, &res)
 }
 
 func TestUnblindBlindedBlockHandlerCapella(t *testing.T) {
@@ -279,20 +332,53 @@ func TestUnblindBlindedBlockHandlerCapella(t *testing.T) {
 			Message:   bbb,
 			Signature: sig.String(),
 		}
+		builderBid = &builderspec.VersionedSignedBuilderBid{
+			Version: consensusspec.DataVersionCapella,
+			Capella: &buildercapella.SignedBuilderBid{
+				Message: &buildercapella.BuilderBid{
+					Value:  uint256.NewInt(101),
+					Pubkey: phase0.BLSPubKey(random48Bytes()),
+					Header: &consensuscapella.ExecutionPayloadHeader{
+						ParentHash:       phase0.Hash32(bt.ParentHash),
+						FeeRecipient:     consensusbellatrix.ExecutionAddress(random20Bytes()),
+						StateRoot:        random32Bytes(),
+						ReceiptsRoot:     random32Bytes(),
+						LogsBloom:        random256Bytes(),
+						PrevRandao:       random32Bytes(),
+						BlockNumber:      1000,
+						GasLimit:         50,
+						GasUsed:          10,
+						Timestamp:        100,
+						ExtraData:        []byte{0x1, 0x2, 0x3, 0x4, 0x5},
+						BaseFeePerGas:    random32Bytes(),
+						BlockHash:        phase0.Hash32(random32Bytes()),
+						TransactionsRoot: phase0.Root(random32Bytes()),
+						WithdrawalsRoot:  phase0.Root(random32Bytes()),
+					},
+				},
+				Signature: phase0.BLSSignature(random96Bytes()),
+			},
+		}
 		body, _ = json.Marshal(payload)
 	)
 
 	wg.Wait()
 
-	err := s.store.PutRegistrationValidator(pk, svrExtended)
+	err := s.store.PutValidator(pk, svrExtended)
 	require.NoError(t, err)
-	err = s.store.PutExecutedPayload(slot, pk, types.Hash(bbb.Body.ExecutionPayloadHeader.BlockHash), gpr)
+
+	err = s.store.PutBuilderBid(
+		bt,
+		GetPayloadResponse{
+			Capella: gpr.Capella,
+		},
+		GetHeaderResponse{
+			Capella: builderBid,
+		},
+		time.Now().UTC(),
+	)
 	require.NoError(t, err)
-	err = s.store.PutBidTrace(BidTraceTimestamp{
-		BidTrace:  bt,
-		Timestamp: time.Now().UTC(),
-	})
-	require.NoError(t, err)
+
 	err = s.updateProposerDuties(slot)
 	require.NoError(t, err)
 	time.Sleep(200 * time.Millisecond)
@@ -309,28 +395,21 @@ func TestUnblindBlindedBlockHandlerCapella(t *testing.T) {
 	require.Equal(t, gpr.Capella, &res)
 
 	bwg.Wait()
+
+	ebh := types.Hash(bbb.Body.ExecutionPayloadHeader.BlockHash)
+	ls, lb := s.latestDeliveredPayloadState.Get()
+	require.Equal(t, slot, ls)
+	require.Equal(t, &ebh, lb)
+
 	time.Sleep(200 * time.Millisecond)
 
-	l, err := s.store.LatestDeliveredSlotStats()
+	b, err := s.store.Builder(bt.BuilderPubkey)
 	require.NoError(t, err)
-	require.Equal(t, slot, l)
+	require.Equal(t, slot, b.LastDeliveredSlot)
 
-	d, err := s.store.BlockBuilder(bt.BuilderPubkey)
+	d, err := s.store.Delivered(ProposerPayloadQuery{Slot: slot, Limit: 10})
 	require.NoError(t, err)
-	require.Equal(t, slot, d.LastDeliveredSlot)
-
-	var deliveredPayload DeliveredPayload
-	err = bolted.SugaredRead(s.store.DB(), func(tx bolted.SugaredReadTx) error {
-		b := tx.Get(payloadDeliveredBlockHashMapPth.Append(types.Hash(bbb.Body.ExecutionPayloadHeader.BlockHash).String()))
-		require.NoError(t, err)
-
-		return json.Unmarshal(b, &deliveredPayload)
-	})
-	require.NoError(t, err)
-	require.Equal(t, "", deliveredPayload.IP)
-	bb, err := json.Marshal(deliveredPayload)
-	require.NoError(t, err)
-	require.NotContains(t, "ip:", string(bb))
+	require.Equal(t, 1, len(d))
 }
 
 func TestPerEpochValidatorsHandler(t *testing.T) {
@@ -375,7 +454,7 @@ func TestPerEpochValidatorsHandler(t *testing.T) {
 
 	wg.Wait()
 
-	err := s.store.PutRegistrationValidator(pk, svrExtended)
+	err := s.store.PutValidator(pk, svrExtended)
 	require.NoError(t, err)
 	err = s.updateProposerDuties(slot)
 	require.NoError(t, err)
@@ -390,7 +469,8 @@ func TestPerEpochValidatorsHandler(t *testing.T) {
 	err = json.NewDecoder(rr.Body).Decode(&res)
 	require.NoError(t, err)
 	require.Len(t, res, 2)
-	require.Equal(t, types.BuilderGetValidatorsResponseEntry{Slot: slot, Entry: &svr}, res[0])
+	require.Contains(t, res, types.BuilderGetValidatorsResponseEntry{Slot: slot, Entry: &svr})
+	require.Contains(t, res, types.BuilderGetValidatorsResponseEntry{Slot: slot + 1, Entry: &svr})
 }
 
 func TestSubmitNewBlocksHandler(t *testing.T) {
@@ -478,35 +558,68 @@ func TestSubmitNewBlocksHandler(t *testing.T) {
 			},
 			Signature: psigCapella.String(),
 		}
-		bodyCapella, _ = json.Marshal(payloadCapella)
+		bodyCapella, _    = json.Marshal(payloadCapella)
+		payloadAttributes = PayloadAttributesEvent{
+			Version: "capella",
+			Data: PayloadAttributesEventData{
+				ProposerIndex:     120,
+				ProposalSlot:      slot + 1,
+				ParentBlockNumber: 0,
+				ParentBlockHash:   bidCapella.ParentHash.String(),
+				ParentBlockRoot:   types.Hash(random32Bytes()).String(),
+				PayloadAttributes: PayloadAttributes{
+					Timestamp:             uint64(s.genesisTime + (slot+1)*SecondsPerSlot),
+					PrevRandao:            randaoHash,
+					SuggestedFeeRecipient: types.Address(random20Bytes()).String(),
+					Withdrawals:           withdrawals,
+				},
+			},
+		}
 	)
+
+	// bidCapella2 := bidCapella
+	// bidCapella2.Value = uint256.NewInt(2984)
+	// psigCapella2, _ := types.SignMessage(bidCapella2, s.cfg.DomainBuilder, skp)
+	// payloadCapella2 := payloadCapella
+	// payloadCapella2.Message = bidCapella2
+	// payloadCapella2.Signature = psigCapella2.String()
+	// bodyCapella2, _ := json.Marshal(payloadCapella2)
+
+	bidCapella3 := bidCapella
+	bidCapella3.Value = uint256.NewInt(2985)
+	psigCapella3, _ := types.SignMessage(bidCapella3, s.cfg.DomainBuilder, skp)
+	payloadCapella3 := payloadCapella
+	payloadCapella3.Message = bidCapella3
+	payloadCapella3.Signature = psigCapella3.String()
+	bodyCapella3, _ := json.Marshal(payloadCapella3)
+
+	bidCapella4 := bidCapella
+	bidCapella4.Value = uint256.NewInt(2986)
+	psigCapella4, _ := types.SignMessage(bidCapella4, s.cfg.DomainBuilder, skp)
+	payloadCapella4 := payloadCapella
+	payloadCapella4.Message = bidCapella4
+	payloadCapella4.Signature = psigCapella4.String()
+	bodyCapella4, _ := json.Marshal(payloadCapella4)
+
+	bidCapella5 := bidCapella
+	bidCapella5.Value = uint256.NewInt(2987)
+	psigCapella5, _ := types.SignMessage(bidCapella5, s.cfg.DomainBuilder, skp)
+	payloadCapella5 := payloadCapella
+	payloadCapella5.Message = bidCapella5
+	payloadCapella5.Signature = psigCapella5.String()
 
 	wg.Wait()
 
-	err := s.store.PutRegistrationValidator(pk, svrExtended)
+	err := s.store.PutValidator(pk, svrExtended)
 	require.NoError(t, err)
 	time.Sleep(200 * time.Millisecond)
 
 	// we do it manually so we dont have to sleep
 	err = s.updateProposerDuties(slot)
 	require.NoError(t, err)
-	err = s.processPayloadAttributes(PayloadAttributesEvent{
-		Version: "capella",
-		Data: PayloadAttributesEventData{
-			ProposerIndex:     120,
-			ProposalSlot:      slot + 1,
-			ParentBlockNumber: 0,
-			ParentBlockHash:   types.Hash(random32Bytes()).String(),
-			ParentBlockRoot:   types.Hash(random32Bytes()).String(),
-			PayloadAttributes: PayloadAttributes{
-				Timestamp:             uint64(s.genesisTime + (slot+1)*SecondsPerSlot),
-				PrevRandao:            randaoHash,
-				SuggestedFeeRecipient: types.Address(random20Bytes()).String(),
-				Withdrawals:           withdrawals,
-			},
-		},
-	})
+	err = s.processPayloadAttributes(payloadAttributes)
 	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond)
 
 	rr := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", io.NopCloser(bytes.NewReader(bodyCapella)))
@@ -516,44 +629,8 @@ func TestSubmitNewBlocksHandler(t *testing.T) {
 	b, _ := io.ReadAll(rr.Body)
 	require.Equal(t, []byte{}, b)
 
-	// pause accepting new block builders but still return 200 because we are using the same block builder
-	err = s.store.RejectNewBlockBuilders()
-	require.NoError(t, err)
-
 	rr = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", io.NopCloser(bytes.NewReader(bodyCapella)))
-	h = http.HandlerFunc(s.submitNewBlockHandler(newRateLimiter(1, 1)))
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
-	b, _ = io.ReadAll(rr.Body)
-	require.Equal(t, []byte{}, b)
-
-	// remove the block builder from the store and try again to make sure we get a 400
-	err = bolted.SugaredWrite(s.store.DB(), func(tx bolted.SugaredWriteTx) error {
-		tx.Delete(blockBuilderMapPth.Append(pkp.String()))
-		return nil
-	})
-	require.NoError(t, err)
-
-	rr = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", io.NopCloser(bytes.NewReader(bodyCapella)))
-	h = http.HandlerFunc(s.submitNewBlockHandler(newRateLimiter(1, 1)))
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusBadRequest, rr.Code)
-	var errResp JSONError
-	err = json.NewDecoder(rr.Body).Decode(&errResp)
-	require.NoError(t, err)
-	require.Equal(t, JSONError{
-		Code:    http.StatusBadRequest,
-		Message: "pausing submission of unknown block builders",
-	}, errResp)
-
-	// now we can accept new block builders again
-	err = s.store.AcceptNewBlockBuilders()
-	require.NoError(t, err)
-
-	rr = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", io.NopCloser(bytes.NewReader(bodyCapella)))
+	req, _ = http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", io.NopCloser(bytes.NewReader(bodyCapella3)))
 	h = http.HandlerFunc(s.submitNewBlockHandler(newRateLimiter(1, 1)))
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
@@ -562,7 +639,7 @@ func TestSubmitNewBlocksHandler(t *testing.T) {
 
 	// octet content type but JSON body
 	rr = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", io.NopCloser(bytes.NewReader(bodyCapella)))
+	req, _ = http.NewRequest(http.MethodPost, "/eth/v1/builder/blocks", io.NopCloser(bytes.NewReader(bodyCapella4)))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	h = http.HandlerFunc(s.submitNewBlockHandler(newRateLimiter(1, 1)))
 	h.ServeHTTP(rr, req)
@@ -572,9 +649,9 @@ func TestSubmitNewBlocksHandler(t *testing.T) {
 
 	// octet
 	sszData := &buildercapella.SubmitBlockRequest{
-		Message:          payloadCapella.Message,
-		ExecutionPayload: payloadCapella.ExecutionPayload,
-		Signature:        phase0.BLSSignature(psigCapella),
+		Message:          payloadCapella5.Message,
+		ExecutionPayload: payloadCapella5.ExecutionPayload,
+		Signature:        phase0.BLSSignature(psigCapella5),
 	}
 	sszBytes, err := sszData.MarshalSSZ()
 	require.NoError(t, err)
@@ -657,7 +734,7 @@ func TestPayloadDeliveredHandler(t *testing.T) {
 		bh := bh32[:]
 		scb64 := random64Bytes()
 		scb := scb64[:]
-		err := s.store.PutDeliveredPayload(DeliveredPayload{
+		err := s.store.PutDelivered(DeliveredPayload{
 			BidTrace: b,
 			SignedBlindedBeaconBlock: &SignedBlindedBeaconBlock{
 				Capella: &apicapella.SignedBlindedBeaconBlock{
@@ -785,7 +862,7 @@ func TestSubmissionPayloadHandler(t *testing.T) {
 	)
 
 	for _, bte := range btes {
-		err := s.store.PutBuilderBlockSubmissionsPayload(bte)
+		err := s.store.PutSubmitted(bte)
 		require.NoError(t, err)
 	}
 
@@ -857,7 +934,7 @@ func TestRegisteredValidatorHandler(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, JSONError{Code: http.StatusBadRequest, Message: "failed to get validator"}, jserr)
 
-	err = s.store.PutRegistrationValidator(pk, svrExtended)
+	err = s.store.PutValidator(pk, svrExtended)
 	require.NoError(t, err)
 
 	rr = httptest.NewRecorder()
@@ -962,13 +1039,16 @@ func TestRefreshKnownValidators(t *testing.T) {
 	var (
 		h, v   = mockBeaconValidatorsHandler(func() {})
 		srv    = httptest.NewServer(h)
-		beacon = NewMultiBeacon([]string{srv.URL})
+		beacon = NewMultiBeacon([]string{srv.URL}, 20)
 		s      = relay{
 			beacon:         beacon,
 			knownValidator: NewKnownValidators(),
+			headSlot:       *atomic.NewUint64(0),
+			log:            logger.WithValues("test", t.Name()),
 		}
 	)
 
+	s.headSlot.Store(uint64(16))
 	t.Cleanup(func() {
 		srv.Close()
 	})
@@ -980,29 +1060,8 @@ func TestRefreshKnownValidators(t *testing.T) {
 	require.True(t, ok)
 }
 
-func TestStartRefreshKnownValidators(t *testing.T) {
-	var (
-		h, v   = mockBeaconValidatorsHandler(func() {})
-		srv    = httptest.NewServer(h)
-		beacon = NewMultiBeacon([]string{srv.URL})
-		s      = relay{
-			beacon:         beacon,
-			knownValidator: NewKnownValidators(),
-		}
-	)
-	t.Cleanup(func() {
-		srv.Close()
-	})
-
-	go s.startRefreshKnownValidators()
-	time.Sleep(300 * time.Millisecond)
-	ok := s.knownValidator.IsKnown(types.PubkeyHex(v.Data[0].Validator.Pubkey))
-	require.True(t, ok)
-}
-
 func TestStartLoopProcessNewSlot(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
-
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 	var (
 		prefix           = fmt.Sprintf("test.%d", rand.Int())
 		slot             = uint64(96)
@@ -1035,8 +1094,8 @@ func TestStartLoopProcessNewSlot(t *testing.T) {
 
 	var (
 		srv      = httptest.NewServer(mux)
-		beacon   = NewMultiBeacon([]string{srv.URL})
-		store, _ = NewStore(prefix)
+		beacon   = NewMultiBeacon([]string{srv.URL}, 20)
+		store, _ = NewPebbleDB(prefix, false)
 		cfg, _   = NewRelayConfig("goerli", "http://localhost:8080", &pk, sk)
 		s        = relay{
 			beacon:           beacon,
@@ -1044,7 +1103,11 @@ func TestStartLoopProcessNewSlot(t *testing.T) {
 			store:            store,
 			randaoState:      newRandaoState(),
 			withdrawalsState: newWithdrawalsState(),
+			knownValidator:   NewKnownValidators(),
 			cfg:              cfg,
+			headSlot:         *atomic.NewUint64(0),
+			log:              logger.WithValues("test", t.Name()),
+			ctx:              context.Background(),
 		}
 		rvrm = &types.RegisterValidatorRequestMessage{
 			FeeRecipient: types.Address(random20Bytes()),
@@ -1065,13 +1128,14 @@ func TestStartLoopProcessNewSlot(t *testing.T) {
 	)
 
 	t.Cleanup(func() {
-		testStoreCleanup(t, store, prefix)
+		store.Close()
+		cleanupTestPebbleDB(t, prefix)
 		srv.Close()
 	})
 
 	time.Sleep(time.Millisecond * 500)
 
-	err := s.store.PutRegistrationValidator(pk, validatorExtended)
+	err := s.store.PutValidator(pk, validatorExtended)
 	require.NoError(t, err)
 
 	go s.startLoopProcessNewSlot()
@@ -1087,14 +1151,25 @@ func TestStartLoopProcessNewSlot(t *testing.T) {
 
 	require.Equal(t, slot, proposerDutiesSlot)
 	require.Len(t, proposerDutiesResponse, 2)
+}
 
-	ls, err := s.store.LatestSlotStats()
-	require.NoError(t, err)
-	require.Equal(t, slot, ls)
+func TestLatestDeliveredPayloadState(t *testing.T) {
+	l := newLatestDeliveredPayloadState()
+	require.Equal(t, uint64(0), l.slot)
+	require.Nil(t, l.blockHash)
+
+	l.Set(1, types.Hash{0x01})
+	require.Equal(t, uint64(1), l.slot)
+	require.Equal(t, &types.Hash{0x01}, l.blockHash)
+
+	l.Set(2, types.Hash{0x02})
+	s, bh := l.Get()
+	require.Equal(t, uint64(2), s)
+	require.Equal(t, &types.Hash{0x02}, bh)
 }
 
 func newTestRelay(t *testing.T, slot uint64, genesisMocks map[string]http.HandlerFunc) *relay {
-	rand.Seed(time.Now().UnixNano())
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var (
@@ -1112,13 +1187,12 @@ func newTestRelay(t *testing.T, slot uint64, genesisMocks map[string]http.Handle
 			"/eth/v1/config/fork_schedule":                               mfh,
 			fmt.Sprintf("/eth/v1/validator/duties/proposer/%d", epoch):   mph0,
 			fmt.Sprintf("/eth/v1/validator/duties/proposer/%d", epoch+1): mph1,
-			"/eth/v1/beacon/states/0/validators":                         mvh,
+			fmt.Sprintf("/eth/v1/beacon/states/%d/validators", slot):     mvh,
 			"/eth/v1/beacon/blocks":                                      mpb,
 		}
-		store, prefix = newTestStore(t)
+		store, prefix = newTestPebbleDB(t)
 		mux           = http.NewServeMux()
 		known         = NewKnownValidators()
-		active        = NewActiveValidators()
 		duty          = NewDutyState()
 		sk, bpk, _    = bls.GenerateNewKeypair()
 		pk, _         = types.BlsPublicKeyToPublicKey(bpk)
@@ -1140,18 +1214,44 @@ func newTestRelay(t *testing.T, slot uint64, genesisMocks map[string]http.Handle
 	for url, h := range mocks {
 		mux.HandleFunc(url, h)
 	}
+	ls := sse.New()
+	mux.HandleFunc("/eth/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		query.Add("stream", "topics")
+		r.URL.RawQuery = query.Encode()
+		ls.ServeHTTP(w, r)
+	})
 	beaconSrv := httptest.NewServer(mux)
+	ls.CreateStream("topics")
 
-	beacon := NewMultiBeacon([]string{beaconSrv.URL})
+	beacon := NewMultiBeacon([]string{beaconSrv.URL}, 20)
+	builder := NewBuilderBlockSimulator(time.Duration(10*time.Second), simSrv.URL)
 
-	s, err := NewRelay(store, beacon, known, active, duty, evtSender, cfg, genesis, true, 60, time.Duration(0), 10000000, false, false, 10*1024*1024, trace.NewNoopTracerProvider().Tracer("relay"))
+	s, err := NewRelay(
+		ctx,
+		store,
+		beacon,
+		builder,
+		known,
+		duty,
+		evtSender,
+		cfg,
+		genesis,
+		slot,
+		1_000, 60, 5, 10_000_000, 10_000_000, 10*1024*1024, 3, 100,
+		false,
+		trace.NewNoopTracerProvider().Tracer("relay"),
+	)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+		ls.Close()
 		beaconSrv.Close()
 		simSrv.Close()
-		testStoreCleanup(t, store, prefix)
-		cancel()
+		store.Close()
+		cleanupTestPebbleDB(t, prefix)
 	})
 
 	return s

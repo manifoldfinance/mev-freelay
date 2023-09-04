@@ -6,7 +6,7 @@ pkgs.mkShell {
     pkgs.gh
     pkgs.go-outline
     pkgs.go-tools
-    pkgs.go_1_19
+    pkgs.go_1_20
     pkgs.gocode
     pkgs.gocode-gomod
     pkgs.godef
@@ -15,6 +15,7 @@ pkgs.mkShell {
     pkgs.gopls
     pkgs.gotools
     pkgs.treefmt
+    pkgs.act
   ];
   hardeningDisable = [ "all" ]; # to build the cross-compiler
   buildInputs = [

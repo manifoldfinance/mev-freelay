@@ -11,52 +11,21 @@
 package freelay
 
 import (
-	"bytes"
-	"compress/gzip"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	runtime "runtime/debug"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
 
 	"github.com/manifoldfinance/mev-freelay/logger"
 )
 
-var gzPool = sync.Pool{
-	New: func() interface{} {
-		w := gzip.NewWriter(io.Discard)
-		return w
-	},
-}
-
-type gzipResponseWriter struct {
-	io.Writer
-	http.ResponseWriter
-}
-
-func (w *gzipResponseWriter) WriteHeader(status int) {
-	w.Header().Del("Content-Length")
-	w.ResponseWriter.WriteHeader(status)
-}
-
-func (w *gzipResponseWriter) Write(b []byte) (int, error) {
-	return w.Writer.Write(b)
-}
-
 func wrapper(f http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		receivedAt := time.Now().UTC().UnixMilli()
-		// panic recovery
 		defer func() {
 			if re := recover(); re != nil {
-				logger.Error(errors.New("an unexpected error"), "panic", "error", fmt.Sprintf("%v", re), "stack", string(runtime.Stack()))
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				logger.Error(errors.New("an unexpected error"), "panic", "error", fmt.Sprintf("%v", re), "stack", string(runtime.Stack()))
 			}
 		}()
 
@@ -67,44 +36,8 @@ func wrapper(f http.Handler) http.HandlerFunc {
 			}
 		}()
 
-		defer func() {
-			checkContext(r.Context(), r.RequestURI, r.Method)
-		}()
-
-		r.Header.Set("X-Req-Received-At", strconv.FormatInt(receivedAt, 10))
-		// in case body is nil we set up an empty reader
-		if r.Body == nil {
-			r.Body = io.NopCloser(bytes.NewReader([]byte{}))
-		}
-
 		w.Header().Add("Content-Type", "application/json")
-
-		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			w.Header().Set("Content-Encoding", "gzip")
-			gz := gzPool.Get().(*gzip.Writer)
-
-			defer gzPool.Put(gz)
-			defer gz.Close() //nolint:errcheck
-			gz.Reset(w)
-
-			f.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, Writer: gz}, r)
-			return
-		}
-
 		f.ServeHTTP(w, r)
-	}
-}
-
-func checkContext(ctx context.Context, pth, method string) {
-	select {
-	case <-ctx.Done():
-		switch ctx.Err() {
-		case context.Canceled:
-			logger.Info("context request cancelled by force. whole process is complete", "path", pth, "method", method)
-		default:
-			logger.Info("context errored", "error", ctx.Err(), "path", pth, "method", method)
-		}
-	default:
 	}
 }
 
@@ -113,6 +46,14 @@ func httpJSONResponse(w http.ResponseWriter, code int, body interface{}) {
 	if err := json.NewEncoder(w).Encode(body); err != nil {
 		logger.Error(err, "failed to encode response body")
 		http.Error(w, "failed to encode response body", http.StatusInternalServerError)
+	}
+}
+
+func httpResponse(w http.ResponseWriter, code int, body string) {
+	w.WriteHeader(code)
+	if _, err := w.Write([]byte(body)); err != nil {
+		logger.Error(err, "failed to write response body")
+		http.Error(w, "failed to write response body", http.StatusInternalServerError)
 	}
 }
 

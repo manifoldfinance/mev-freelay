@@ -67,6 +67,10 @@ func SetVersion(v string) {
 	zlogger.SetVersion(v)
 }
 
+func Z() *logr.Logger {
+	return zlogger.Z()
+}
+
 func includeVersion(v, msg string) string {
 	return fmt.Sprintf("%s\t%s", v, msg)
 }

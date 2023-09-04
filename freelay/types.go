@@ -83,9 +83,15 @@ type DeliveredPayload struct {
 }
 
 type MissedPayload struct {
-	TimeIntoSlot int64     `json:"time_into_slot"`
-	SlotStart    uint64    `json:"slot_start"`
-	Timestamp    time.Time `json:"timestamp"`
+	TimeIntoSlot   int64           `json:"time_into_slot"`
+	SlotStart      uint64          `json:"slot_start"`
+	Timestamp      time.Time       `json:"timestamp"`
+	Slot           uint64          `json:"slot,string"`
+	ProposerPubkey types.PublicKey `json:"proposer_pubkey" ssz-size:"48"`
+	BlockHash      types.Hash      `json:"block_hash" ssz-size:"32"`
+	IP             string          `json:"ip,omitempty"`
+	Error          string          `json:"error,omitempty"`
+	DeliveredError string          `json:"delivered_error,omitempty"`
 }
 
 type BuilderGetValidatorsResponseEntry struct {

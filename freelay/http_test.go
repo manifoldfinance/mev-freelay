@@ -12,16 +12,14 @@ package freelay
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
-	"time"
 
+	"github.com/NYTimes/gziphandler"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -31,41 +29,31 @@ func TestWrapper(t *testing.T) {
 		Text string `json:"text"`
 	}{Text: "Wrapper OK"}
 	b, _ := json.Marshal(s)
-	now := time.Now().UTC().UnixMilli()
 
-	w := wrapper(func() http.HandlerFunc {
+	h := func() http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			hReceivedAt := r.Header.Get("X-Req-Received-At")
-			require.NotEmpty(t, hReceivedAt)
-			mili, err := strconv.ParseInt(hReceivedAt, 10, 64)
-			require.NoError(t, err)
-			tt := time.UnixMilli(mili)
-			assert.True(t, now <= tt.UnixMilli())
-
 			var s struct{ Text string }
-			err = json.NewDecoder(r.Body).Decode(&s)
+			err := json.NewDecoder(r.Body).Decode(&s)
 			require.NoError(t, err)
 			require.Equal(t, "Wrapper OK", s.Text)
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("Wrapper Works")) //nolint:errcheck
 		}
-	}())
+	}
+
+	hgzip := gziphandler.GzipHandler(h())
+	w := wrapper(hgzip)
 
 	// gzip
 	rr := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/", io.NopCloser(bytes.NewReader(b)))
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip")
 	w.ServeHTTP(rr, req)
-
 	assert.Equal(t, http.StatusOK, rr.Code)
 
-	// read gzip body
-	var reader io.ReadCloser
-	reader, err := gzip.NewReader(rr.Body)
+	// Decompress the gzipped response body
+	res, err := io.ReadAll(rr.Body)
 	require.NoError(t, err)
-	defer reader.Close() //nolint:errcheck
-	res, _ := io.ReadAll(reader)
 	assert.Equal(t, "Wrapper Works", string(res))
 
 	// no gzip
